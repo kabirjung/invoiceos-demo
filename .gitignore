@@ -1,0 +1,18 @@
+# Demo data (regenerates / shifts on server restart)
+invoiceos.sqlite3
+invoiceos.sqlite3-shm
+invoiceos.sqlite3-wal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.server.log
+
+# Bundles / extracted assets not part of source
+InvoiceOS-orb.zip
+orb-extracted/
+
+# OS
+.DS_Store
+Thumbs.db
