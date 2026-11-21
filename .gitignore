@@ -17,3 +17,7 @@ orb-extracted/
 .DS_Store
 Thumbs.db
 app.js.bak2
+.vercel
+
+# Supabase CLI local dev
+.supabase/

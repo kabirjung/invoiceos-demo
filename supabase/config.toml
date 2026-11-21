@@ -1,0 +1,31 @@
+[project]
+id = ""
+
+[db]
+major_version = 15
+
+[auth]
+external_email_enabled = true
+external_phone_enabled = false
+
+[storage]
+enabled = true
+
+[realtime]
+enabled = true
+
+[analytics]
+enabled = false
+
+[edge_runtime]
+remote_version = "v147"
+
+[networking]
+egress_vpc_endpoint_ids = []
+
+[pooler]
+enabled = true
+default_pooler_mode = "transaction"
+default_max_client_conn = 100
+default_pool_size = 25
+default_overflow_pool_size = 50
