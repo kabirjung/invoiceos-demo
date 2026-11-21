@@ -1,16 +1,13 @@
 {
   "version": 2,
   "builds": [
-    { "src": "server.py", "use": "@vercel/python" },
     { "src": "index.html", "use": "@vercel/static" },
     { "src": "app.js", "use": "@vercel/static" }
   ],
   "routes": [
-    { "src": "/app.js", "dest": "/app.js" },
+    { "src": "/app.js", "headers": { "cache-control": "public, max-age=31536000, immutable" }, "status": 200, "dest": "/app.js" },
     { "src": "/favicon.ico", "status": 204 },
-    { "src": "/api/(.*)", "dest": "/server.py" },
-    { "src": "/demo(/?)", "dest": "/index.html" },
-    { "src": "/(.*)", "dest": "/index.html" }
+    { "src": "/(.*)", "status": 200, "dest": "/index.html" }
   ],
   "cleanUrls": true,
   "trailingSlash": false
