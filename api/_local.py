@@ -59,6 +59,13 @@ CREATE TABLE IF NOT EXISTS payment_run_items (id TEXT PRIMARY KEY, run_id TEXT N
   amount NUMERIC NOT NULL, discount NUMERIC DEFAULT 0, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS org_settings (org TEXT PRIMARY KEY, opening_balance NUMERIC DEFAULT 0,
   approval_threshold NUMERIC DEFAULT 0, updated_at TEXT NOT NULL);
+-- RECONCILIATION
+CREATE TABLE IF NOT EXISTS bank_reconciliations (id TEXT PRIMARY KEY, org TEXT NOT NULL, line_date TEXT NOT NULL,
+  line_desc TEXT NOT NULL DEFAULT '', amount NUMERIC NOT NULL CHECK (amount > 0), direction TEXT NOT NULL CHECK (direction IN ('credit','debit')),
+  matched_type TEXT NOT NULL CHECK (matched_type IN ('invoice','bill')), matched_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'Matched' CHECK (status IN ('Matched','Skipped')), created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_recon_match ON bank_reconciliations(org, matched_type, matched_id) WHERE status='Matched';
+-- END RECONCILIATION
 """
 # Columns added after the first release; _migrate() adds them to older local databases.
 ADDED_COLUMNS = {
@@ -67,7 +74,7 @@ ADDED_COLUMNS = {
               ("discount_by", "TEXT DEFAULT ''"), ("payment_run_id", "TEXT DEFAULT ''")],
 }
 TABLES = {"businesses", "invoices", "activity", "comments", "bills", "bill_activity", "connections", "calendar_events", "staff",
-          "notifications", "reminders", "payment_runs", "payment_run_items", "org_settings"}
+          "notifications", "reminders", "payment_runs", "payment_run_items", "org_settings", "bank_reconciliations"}
 COLUMN_RE = re.compile(r"[a-z_]+")
 
 

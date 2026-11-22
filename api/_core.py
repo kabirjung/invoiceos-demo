@@ -1321,7 +1321,439 @@ def get_audit_pack(sb, query):
                  "generated_by": person["name"], "note": "Demo data only. Generated from recorded activity rows."}
 
 
+# --- GST ---
+# Read-only GST workspace preview. Computed from invoices (output tax) and bills (input tax credit).
+# Nothing is filed or submitted anywhere.
+GST_MONTH_RE = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
+GST_RATES = (0, 5, 12, 18, 28)
+GST_DEFAULT_RATE = Decimal("18")
+GST_SKIP = {"Draft", "Rejected"}
+GST_ROLES = {"owner", "finance_manager", "ar", "ap", "auditor"}
+P2 = Decimal("0.01")
+
+
+def _d(v):
+    try:
+        return Decimal(str(v if v not in (None, "") else 0))
+    except InvalidOperation:
+        return Decimal(0)
+
+
+def _q(v):
+    return v.quantize(P2, rounding=ROUND_HALF_UP)
+
+
+def gst_months(count=6):
+    t = datetime.date.today()
+    y, m = t.year, t.month
+    out = []
+    for _ in range(count):
+        out.append(f"{y:04d}-{m:02d}")
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    return out
+
+
+def _gst_split(tax, supplier_gstin, buyer_gstin):
+    """Return (cgst, sgst, igst). Same two-digit state code -> CGST+SGST split equally, else IGST."""
+    a, b = (supplier_gstin or "")[:2], (buyer_gstin or "")[:2]
+    if a.isdigit() and a == b:
+        c = _q(tax / 2)
+        return c, tax - c, Decimal(0)
+    return Decimal(0), Decimal(0), tax
+
+
+def get_gst(sb, query):
+    role, info, person = role_gate(sb, query, GST_ROLES, "the GST workspace")
+    org = info["org"]
+    raw = (query.get("month", [""])[0] or "").strip()
+    months = gst_months()
+    month = raw or months[0]
+    if not GST_MONTH_RE.fullmatch(month):
+        raise ApiError(400, "month must look like 2026-11")
+    biz_rows = sb.select("businesses", "id,name,gstin")
+    names = {b["id"]: b["name"] for b in biz_rows}
+    gstins = {b["id"]: b.get("gstin") or "" for b in biz_rows}
+    inv_out = [i for i in sb.select("invoices", "*", {"supplier": eq(org)})]
+    inv_in = {i["id"].lower(): i for i in sb.select("invoices", "*", {"customer": eq(org)})}
+    zero = lambda: {"cgst": Decimal(0), "sgst": Decimal(0), "igst": Decimal(0), "taxable": Decimal(0)}
+    out_t, in_t = zero(), zero()
+    rates = {r: {"rate": r, "out_taxable": Decimal(0), "out_tax": Decimal(0), "in_taxable": Decimal(0), "in_tax": Decimal(0)}
+             for r in GST_RATES}
+    out_rows, drafts, disputes, missing_gstin = [], [], [], []
+
+    def add_rate(rate, side, taxable, tax):
+        r = rates.get(int(rate)) if rate == rate.to_integral_value() else None
+        if r is None:
+            r = rates.setdefault(int(rate), {"rate": int(rate), "out_taxable": Decimal(0), "out_tax": Decimal(0),
+                                             "in_taxable": Decimal(0), "in_tax": Decimal(0)})
+        r[side + "_taxable"] += taxable
+        r[side + "_tax"] += tax
+
+    for i in sorted(inv_out, key=lambda x: x["id"]):
+        if str(i["issue_date"])[:7] != month:
+            continue
+        if i["status"] == "Draft":
+            drafts.append(i["id"])
+        if i["status"] in GST_SKIP:
+            continue
+        rate = _d(i["tax"])
+        taxable = _q(_d(i["qty"]) * _d(i["rate"]))
+        tax = _q(taxable * rate / 100)
+        sg, cg = (i.get("supplier_gstin") or "").strip(), (i.get("customer_gstin") or "").strip()
+        if not sg or not cg:
+            missing_gstin.append(i["id"])
+        c, s, g = _gst_split(tax, sg, cg)
+        for k, v in (("cgst", c), ("sgst", s), ("igst", g), ("taxable", taxable)):
+            out_t[k] += v
+        add_rate(rate, "out", taxable, tax)
+        if i["status"] == "Dispute":
+            disputes.append(i["id"])
+        out_rows.append({"id": i["id"], "party": names.get(i["customer"], i["customer"]), "date": str(i["issue_date"])[:10],
+                         "status": i["status"], "rate": float(rate), "taxable": float(taxable), "cgst": float(c),
+                         "sgst": float(s), "igst": float(g), "tax": float(tax), "gstin_ok": bool(sg and cg)})
+    itc_rows, linked_rate_n = [], 0
+    for b in sorted(sb.select("bills", "*", {"buyer": eq(org)}), key=lambda x: x["id"]):
+        if str(b["received_date"])[:7] != month or b["status"] in GST_SKIP:
+            continue
+        amount = _q(_d(b["amount"]))
+        inv = inv_in.get(str(b["vendor_invoice_id"]).lower())
+        if inv is not None and inv["supplier"] != b["vendor"]:
+            inv = None
+        sup_g = ((inv or {}).get("supplier_gstin") or gstins.get(b["vendor"], "")).strip()
+        buy_g = ((inv or {}).get("customer_gstin") or gstins.get(org, "")).strip()
+        rate, basis = GST_DEFAULT_RATE, "assumed"
+        if inv is not None and inv["status"] not in GST_SKIP:
+            rate, basis = _d(inv["tax"]), "invoice"
+            linked_rate_n += 1
+        taxable = _q(amount / (1 + rate / 100))
+        tax = amount - taxable
+        c, s, g = _gst_split(tax, sup_g, buy_g)
+        reasons = []
+        if inv is None:
+            reasons.append("Supplier invoice not found")
+        elif inv["status"] in GST_SKIP:
+            reasons.append(f"Supplier invoice is {inv['status'].lower()}, not yet Sent")
+        elif abs(_d(inv["total"]) - amount) > P2:
+            reasons.append(f"Amount differs: bill {inr(amount)} vs invoice {inr(inv['total'])}")
+        if not sup_g or not buy_g:
+            reasons.append("GSTIN missing")
+        if inv is not None and inv["status"] == "Dispute":
+            disputes.append(inv["id"])
+        for k, v in (("cgst", c), ("sgst", s), ("igst", g), ("taxable", taxable)):
+            in_t[k] += v
+        add_rate(rate, "in", taxable, tax)
+        itc_rows.append({"id": b["id"], "vendor": names.get(b["vendor"], b["vendor"]), "ref": b["vendor_invoice_id"],
+                         "invoice_id": inv["id"] if inv else "", "bill_amount": float(amount),
+                         "invoice_amount": float(_q(_d(inv["total"]))) if inv else None, "rate": float(rate),
+                         "rate_basis": basis, "taxable": float(taxable), "tax": float(tax), "status": b["status"],
+                         "match": "ok" if not reasons else "flag", "reasons": reasons})
+    out_tax = out_t["cgst"] + out_t["sgst"] + out_t["igst"]
+    in_tax = in_t["cgst"] + in_t["sgst"] + in_t["igst"]
+    net = out_tax - in_tax
+    flagged = [r for r in itc_rows if r["match"] == "flag"]
+    at_risk = sum((_d(r["tax"]) for r in flagged), Decimal(0))
+    pack = lambda t: {"cgst": float(t["cgst"]), "sgst": float(t["sgst"]), "igst": float(t["igst"]),
+                      "taxable": float(t["taxable"]), "tax": float(t["cgst"] + t["sgst"] + t["igst"])}
+
+    def check(key, label, bad, ok_text, warn_text):
+        return {"key": key, "label": label, "state": "warn" if bad else "pass", "detail": warn_text if bad else ok_text}
+    checklist = [
+        check("gstin", "All invoices have GSTINs", missing_gstin, "Every invoice this month has both GSTINs.",
+              f"{len(missing_gstin)} invoice(s) missing a GSTIN: " + ", ".join(missing_gstin[:4])),
+        check("itc", "No unmatched input tax credit", flagged, "Every bill matches a Sent supplier invoice.",
+              f"{len(flagged)} bill(s) flagged, {inr(at_risk)} of ITC at risk."),
+        check("disputes", "No disputes pending", disputes, "No disputed invoices this month.",
+              f"{len(set(disputes))} disputed invoice(s): " + ", ".join(sorted(set(disputes))[:4])),
+        check("drafts", "No Draft invoices in the month", drafts, "No Draft invoices in this month.",
+              f"{len(drafts)} Draft invoice(s) excluded from output tax: " + ", ".join(drafts[:4])),
+        check("activity", "Month has recorded activity", not (out_rows or itc_rows), "Invoices or bills found for this month.",
+              "No invoices or bills dated in this month."),
+    ]
+    return 200, {
+        "org": org, "org_name": names.get(org, org), "month": month, "months": months, "today": today(),
+        "read_only": bool(info.get("read_only")),
+        "summary": {"output_tax": float(out_tax), "itc": float(in_tax), "net": float(abs(net)),
+                    "net_state": "payable" if net > 0 else ("credit" if net < 0 else "nil"),
+                    "itc_at_risk": float(at_risk), "output_count": len(out_rows), "input_count": len(itc_rows)},
+        "split": {"output": pack(out_t), "input": pack(in_t)},
+        "rates": [{k: (float(v) if isinstance(v, Decimal) else v) for k, v in rates[r].items()} for r in sorted(rates)],
+        "output_invoices": out_rows, "itc": itc_rows, "checklist": checklist,
+        "ready": all(c["state"] == "pass" for c in checklist),
+        "notes": ["Preview, no filing: nothing is submitted to the GST portal.",
+                  "Bills carry only a total. Taxable value and tax assume 18% unless a Sent supplier invoice gives the real rate "
+                  f"({linked_rate_n} of {len(itc_rows)} bills this month use a linked invoice rate).",
+                  "Same-state GSTINs (first two digits) split CGST and SGST equally; different states are IGST.",
+                  "HSN/SAC codes are not held in this demo data, so no HSN summary is shown."],
+    }
+# --- END GST ---
+
+
 # --------------------------------------------------------------------------- dispatch
+
+# --- RECONCILIATION ---------------------------------------------------------------------------------
+# Demo bank reconciliation. Statement lines come from the browser (pasted/sample CSV); nothing connects to a bank.
+# Confirming a match goes through patch_invoice_status / patch_bill_status so transition tables, optimistic
+# guards, activity logging, linked invoice<->bill sync and BUYER_ONLY rules all still apply.
+RECON_VIEW_ROLES = {"owner", "finance_manager", "ar", "ap", "approver", "auditor"}
+RECON_WRITE_ROLES = RECON_VIEW_ROLES - {"auditor"}
+RECON_MAX_LINES = 200
+RECON_AR = {"Sent", "Viewed", "Approved", "Overdue", "Partially paid"}
+RECON_AP = {"Approved", "Scheduled"}
+RECON_SHORT_PCT = Decimal("0.02")  # a credit up to 2% under the due amount may be bank charges
+
+
+def _rnorm(text):
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def _recon_line(raw, i):
+    if not isinstance(raw, dict):
+        raise ApiError(400, f"Statement line {i + 1} is not valid")
+    date = iso_date(raw.get("date"), f"Line {i + 1} date")
+    desc = clean_text(raw.get("description", ""), f"Line {i + 1} description", 200, required=False)
+    cr = decimal_value(raw.get("credit") or 0, f"Line {i + 1} credit", maximum=Decimal("1000000000"))
+    dr = decimal_value(raw.get("debit") or 0, f"Line {i + 1} debit", maximum=Decimal("1000000000"))
+    if (cr > 0) == (dr > 0):
+        raise ApiError(400, f"Line {i + 1} needs either a debit or a credit amount")
+    direction = "credit" if cr > 0 else "debit"
+    amount = (cr or dr).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if amount <= 0:
+        raise ApiError(400, f"Line {i + 1} amount must be greater than zero")
+    return {"idx": i, "date": date, "description": desc, "direction": direction, "amount": amount}
+
+
+def _recon_actor(sb, d, allowed, label):
+    org = org_id(d.get("org") if isinstance(d, dict) else None, "Organisation")
+    role, info, person = role_gate(sb, {"role": d.get("role"), "actor": d.get("actor")}, allowed, label)
+    if info["org"] != org:
+        raise ApiError(403, "This role does not belong to that business")
+    return org, role, person
+
+
+def _recon_candidates(sb, org):
+    names = {}
+
+    def nm(i):
+        if i not in names:
+            names[i] = biz_name(sb, i)
+        return names[i]
+
+    out = []
+    for r in sb.select("invoices", "*", {"supplier": eq(org)}):
+        if r["status"] not in RECON_AR:
+            continue
+        due = Decimal(str(r["total"])) - Decimal(str(r.get("amount_paid") or 0))
+        if due <= 0:
+            continue
+        scopes = connection_scopes(sb, r["supplier"], r["customer"])
+        block = ""
+        if "Paid" not in INVOICE_TRANSITIONS.get(r["status"], set()):
+            block = f"{r['id']} is {r['status']}. The buyer has to approve it before it can be marked Paid."
+        elif "exchange_invoices" not in scopes or "share_payment_status" not in scopes:
+            block = "Payment status sharing is not enabled for this connection."
+        out.append({"type": "invoice", "id": r["id"], "direction": "credit", "due": due.quantize(Decimal("0.01")),
+                    "total": Decimal(str(r["total"])), "refs": [r["id"], r.get("po_number") or ""],
+                    "party": nm(r["customer"]), "due_date": r["due_date"], "status": r["status"], "block": block})
+    for r in sb.select("bills", "*", {"buyer": eq(org)}):
+        if r["status"] not in RECON_AP:
+            continue
+        out.append({"type": "bill", "id": r["id"], "direction": "debit", "due": Decimal(str(r["amount"])).quantize(Decimal("0.01")),
+                    "total": Decimal(str(r["amount"])), "refs": [r["vendor_invoice_id"], r["id"], r.get("po_number") or ""],
+                    "party": nm(r["vendor"]), "due_date": r["due_date"], "status": r["status"],
+                    "block": "" if "Paid" in BILL_TRANSITIONS.get(r["status"], set()) else f"{r['id']} is {r['status']}."})
+    return out
+
+
+def _recon_score(line, cand):
+    """Return (score, ref_hit, reasons) for one statement line against one open invoice/bill, or None."""
+    if line["direction"] != cand["direction"]:
+        return None
+    score, reasons, ref_hit = 0, [], False
+    diff = cand["due"] - line["amount"]
+    exact = diff == 0 or line["amount"] == cand["total"]
+    short = (not exact) and 0 < diff <= max(cand["due"] * RECON_SHORT_PCT, Decimal("0")) and line["direction"] == "credit"
+    if exact:
+        score += 50
+        reasons.append("Amount equal")
+    elif short:
+        score += 30
+        reasons.append(f"Amount {inr(diff)} short of {inr(cand['due'])} (possible bank charges)")
+    ndesc = _rnorm(line["description"])
+    for ref in cand["refs"]:
+        nref = _rnorm(ref)
+        if len(nref) >= 4 and nref in ndesc:
+            score += 40
+            ref_hit = True
+            reasons.append(f"reference {ref} found")
+            break
+    if not ref_hit:
+        for ref in cand["refs"]:
+            groups = re.findall(r"\d{3,}", str(ref))
+            if groups and groups[-1] in ndesc and len(groups[-1]) >= 3:
+                score += 35
+                ref_hit = True
+                reasons.append(f"partial reference …{groups[-1]} found")
+                break
+    word = next((w for w in re.findall(r"[a-z]{4,}", cand["party"].lower()) if w not in {"private", "limited", "retail", "studio"}), "")
+    if word and word in line["description"].lower():
+        score += 10
+        reasons.append(f"{cand['party']} named")
+    try:
+        gap = abs((datetime.date.fromisoformat(line["date"]) - datetime.date.fromisoformat(cand["due_date"])).days)
+        if gap <= 10:
+            score += 10
+            reasons.append("near due date")
+    except ValueError:
+        pass
+    if not (exact or short) or (short and not ref_hit):
+        return None
+    return score, ref_hit, reasons, exact
+
+
+def _recon_level(score, exact):
+    if score >= 80 and exact:
+        return "High"
+    if score >= 50:
+        return "Medium"
+    return "Low"
+
+
+def reconcile_suggest(sb, d):
+    org, role, person = _recon_actor(sb, d, RECON_VIEW_ROLES, "bank reconciliation")
+    raw = d.get("lines")
+    if not isinstance(raw, list) or not raw:
+        raise ApiError(400, "Add at least one statement line")
+    if len(raw) > RECON_MAX_LINES:
+        raise ApiError(400, f"A statement can have up to {RECON_MAX_LINES} lines in the demo")
+    lines = [_recon_line(r, i) for i, r in enumerate(raw)]
+    cands = _recon_candidates(sb, org)
+    try:
+        done = sb.select("bank_reconciliations", "*", {"org": eq(org), "status": eq("Matched")})
+    except ApiError:
+        done = []  # table arrives with migration 005
+    done_keys = {(r["line_date"], str(_rnorm(r["line_desc"])), Decimal(str(r["amount"])).quantize(Decimal("0.01")), r["direction"]): r for r in done}
+    seen, flags = {}, {}
+    for ln in lines:
+        key = (ln["date"], _rnorm(ln["description"]), ln["amount"], ln["direction"])
+        if key in done_keys:
+            r = done_keys[key]
+            flags[ln["idx"]] = ("Reconciled", f"Already reconciled with {r['matched_id']}")
+        elif key in seen:
+            flags[ln["idx"]] = ("Duplicate", f"Duplicate of line {seen[key] + 1}; not matched twice")
+        else:
+            seen[key] = ln["idx"]
+    pairs = []
+    for ln in lines:
+        if ln["idx"] in flags:
+            continue
+        scored = []
+        for c in cands:
+            sc = _recon_score(ln, c)
+            if sc:
+                scored.append((sc, c))
+        for sc, c in scored:
+            score, ref_hit, reasons, exact = sc
+            if exact and not ref_hit and sum(1 for o, _ in scored if o[3] and not o[1]) > 1:
+                score = min(score, 35)
+                reasons = reasons + ["several open items share this amount"]
+            pairs.append((score, ln["idx"], c, ref_hit, reasons, exact))
+    pairs.sort(key=lambda p: (-p[0], p[1], p[2]["id"]))
+    used_l, used_c, picked = set(), set(), {}
+    for score, i, c, ref_hit, reasons, exact in pairs:
+        if i in used_l or c["id"] in used_c or score < 30:
+            continue
+        used_l.add(i)
+        used_c.add(c["id"])
+        picked[i] = (score, c, reasons, exact)
+    out = []
+    for ln in lines:
+        row = {"idx": ln["idx"], "date": ln["date"], "description": ln["description"], "direction": ln["direction"],
+               "amount": float(ln["amount"]), "state": "Unmatched", "note": "No open invoice or bill matches this line", "suggestion": None}
+        if ln["idx"] in flags:
+            row["state"], row["note"] = flags[ln["idx"]]
+        elif ln["idx"] in picked:
+            score, c, reasons, exact = picked[ln["idx"]]
+            level = _recon_level(score, exact)
+            row.update(state="Suggested", note="")
+            row["suggestion"] = {
+                "type": c["type"], "id": c["id"], "party": c["party"], "status": c["status"], "due_date": c["due_date"],
+                "due_amount": float(c["due"]), "diff": float(c["due"] - ln["amount"]), "score": score, "confidence": level,
+                "reason": " + ".join(reasons), "confirmable": not c["block"], "block_reason": c["block"],
+            }
+        out.append(row)
+    sug = [r for r in out if r["suggestion"]]
+    summary = {"lines": len(out), "suggested": len(sug), "high": sum(1 for r in sug if r["suggestion"]["confidence"] == "High" and r["suggestion"]["confirmable"]),
+               "duplicates": sum(1 for r in out if r["state"] == "Duplicate"),
+               "unmatched": sum(1 for r in out if r["state"] == "Unmatched"),
+               "credits": float(sum(Decimal(str(r["amount"])) for r in out if r["direction"] == "credit")),
+               "debits": float(sum(Decimal(str(r["amount"])) for r in out if r["direction"] == "debit"))}
+    return 200, {"org": org, "demo": True, "simulated": "Demo statement. No real bank connection.", "lines": out, "summary": summary}
+
+
+def reconcile_confirm(sb, d):
+    org, role, person = _recon_actor(sb, d, RECON_WRITE_ROLES, "confirming reconciliations")
+    line = _recon_line(d.get("line") if isinstance(d.get("line"), dict) else {}, 0)
+    mtype = d.get("match_type")
+    if mtype not in ("invoice", "bill"):
+        raise ApiError(400, "match_type must be invoice or bill")
+    mid = clean_text(d.get("match_id"), "Match id", 40)
+    if not INVOICE_ID_RE.fullmatch(mid):
+        raise ApiError(400, "Match id is not valid")
+    if (mtype == "invoice") != (line["direction"] == "credit"):
+        raise ApiError(400, "Credits match invoices and debits match bills")
+    cand = next((c for c in _recon_candidates(sb, org) if c["type"] == mtype and c["id"] == mid), None)
+    if not cand:
+        table = "invoices" if mtype == "invoice" else "bills"
+        row = sb.one(table, "id,status", {"id": eq(mid)})
+        if not row:
+            raise ApiError(404, f"{mtype.capitalize()} not found")
+        if row["status"] == "Paid":
+            raise ApiError(409, f"{mid} is already Paid")
+        raise ApiError(409, f"{mid} is not open for reconciliation ({row['status']}) in this business")
+    if cand["block"]:
+        raise ApiError(409, cand["block"])
+    diff = cand["due"] - line["amount"]
+    if not (diff == 0 or line["amount"] == cand["total"] or (line["direction"] == "credit" and 0 < diff <= cand["due"] * RECON_SHORT_PCT)):
+        raise ApiError(400, "The bank amount does not match this item")
+    try:
+        if sb.one("bank_reconciliations", "id", {"org": eq(org), "matched_type": eq(mtype), "matched_id": eq(mid), "status": eq("Matched")}):
+            raise ApiError(409, f"{mid} is already reconciled")
+    except ApiError as e:
+        if e.status == 409 and "already reconciled" in e.message:
+            raise
+    handler = patch_invoice_status if mtype == "invoice" else patch_bill_status
+    handler(sb, mid, {"status": "Paid", "actor": org, "role": role})
+    detail = f"Reconciled with bank line {line['date']} · {line['description'][:90] or 'no description'} · {inr(line['amount'])} (demo statement)"
+    stamp = now()
+    if mtype == "invoice":
+        sb.insert("activity", {"invoice_id": mid, "actor": org, "action": "Reconciled", "detail": detail, "created_at": stamp})
+    else:
+        sb.insert("bill_activity", {"bill_id": mid, "actor": org, "action": "Reconciled", "detail": detail, "created_at": stamp})
+    rid = "rec_" + uuid.uuid4().hex[:12]
+    try:
+        sb.insert("bank_reconciliations", {"id": rid, "org": org, "line_date": line["date"], "line_desc": line["description"],
+                                           "amount": str(line["amount"]), "direction": line["direction"], "matched_type": mtype,
+                                           "matched_id": mid, "status": "Matched", "created_by": person["name"], "created_at": stamp})
+    except ApiError as e:  # optional until migration 005
+        print("InvoiceOS: reconciliation record not stored:", e.message)
+    return 200, {"ok": True, "id": rid, "matched_type": mtype, "matched_id": mid, "status": "Paid"}
+
+
+def get_reconciliations(sb, query):
+    org = org_id((query.get("org") or [""])[0], "Organisation")
+    role = ((query.get("role") or [""])[0] or "").strip()
+    _, _, _ = _recon_actor(sb, {"org": org, "role": role, "actor": org}, RECON_VIEW_ROLES, "bank reconciliation")
+    try:
+        rows = sb.select("bank_reconciliations", "*", {"org": eq(org)}, order="created_at.desc", limit=50)
+    except ApiError:
+        rows = []
+    return 200, {"org": org, "items": rows}
+
+
+# --- END RECONCILIATION -----------------------------------------------------------------------------
+
 
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
@@ -1380,8 +1812,12 @@ def dispatch(method, raw_path, headers, body):
                 return get_partners(sb, query)
             if path == "/api/collections":
                 return get_collections(sb, query)
+            if path == "/api/reconcile":
+                return get_reconciliations(sb, query)
             if path == "/api/audit-pack":
                 return get_audit_pack(sb, query)
+            if path == "/api/gst":
+                return get_gst(sb, query)
             raise ApiError(404, "Not found")
         if method == "POST":
             if path == "/api/invoices":
@@ -1398,6 +1834,10 @@ def dispatch(method, raw_path, headers, body):
                 return set_opening_balance(sb, data)
             if path == "/api/settings/approval-rule":
                 return set_approval_rule(sb, data)
+            if path == "/api/reconcile/suggest":
+                return reconcile_suggest(sb, data)
+            if path == "/api/reconcile/confirm":
+                return reconcile_confirm(sb, data)
             if path == "/api/payment-runs/preview":
                 return preview_run(sb, data)
             if path == "/api/payment-runs":

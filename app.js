@@ -28,7 +28,7 @@ const requestedRole=demoRoute?(demoParams.get('role')||''):'';
 if(requestedRole&&profiles[requestedRole]){role=requestedRole;store.set('invoiceos_role',role)}
 const demoPageParam=demoRoute?(demoParams.get('page')||''):'';
 const demoRecordId=demoRoute?(demoParams.get('id')||''):'';
-const demoStartPages=new Set(['overview','invoices','bills','approvals','disputes','connections','payments','team','activity','insights','more','builder','billUpload','portal','calendar','cashflow','collections','paymentRun','auditPack']);
+const demoStartPages=new Set(['overview','invoices','bills','approvals','disputes','connections','payments','team','activity','insights','more','builder','billUpload','portal','calendar','cashflow','collections','paymentRun','auditPack','gst','reconcile']);
 let page=demoPick?'roles':demoRoute?'boot':'landing',selectedId=demoRecordId,state={businesses:[],invoices:[],comments:[],activity:[],bill_activity:[],bills:[],connections:[],calendar_events:[],staff:[]},toastTimer;
 const me=()=>profiles[role], company=id=>state.businesses.find(b=>b.id===id)||{id,name:id||'Business',gstin:'',city:''};
 function portalLabel(){return me().side==='buyer'?'Buyer portal':'Supplier portal'}
@@ -833,14 +833,14 @@ document.addEventListener('submit',async e=>{
    Figures come from the API, computed from stored rows. Nothing here
    emails anyone, files anything or moves money.
    =================================================================== */
-const BIZ_ACCESS={cashflow:['owner','finance_manager','auditor'],collections:['owner','finance_manager','ar'],paymentRun:['ap','approver'],auditPack:['auditor','owner','finance_manager']};
+const BIZ_ACCESS={cashflow:['owner','finance_manager','auditor'],collections:['owner','finance_manager','ar'],paymentRun:['ap','approver'],auditPack:['auditor','owner','finance_manager'],gst:['owner','finance_manager','ar','ap','auditor'],reconcile:['owner','finance_manager','ar','ap','approver','auditor']};
 const BIZ_INTERNAL=['owner','finance_manager','ar','ap','approver','auditor'];
 const bizInternal=()=>BIZ_INTERNAL.includes(role);
 const bizCan=p=>(BIZ_ACCESS[p]||[]).includes(role);
 function bizHiddenPages(){const h=new Set();for(const[k,r]of Object.entries(BIZ_ACCESS))if(!r.includes(role))h.add(k);return h}
-function bizMoreLinks(){return[['cashflow','≋','Cash-flow forecast','Weekly inflows, outflows and projected balance'],['collections','⏱','Collections','Overdue receivables, reminders and promises'],['paymentRun','⇶','Payment run','Batch approved bills and preview the cash impact'],['auditPack','⇩','Audit pack','Download the recorded trail as CSV']]}
-function bizTitles(){return{cashflow:'Cash-flow forecast',collections:'Collections',paymentRun:'Payment run',auditPack:'Audit pack'}}
-function bizViews(){return{cashflow:bizCashflowPage,collections:bizCollectionsPage,paymentRun:bizPaymentRunPage,auditPack:bizAuditPage}}
+function bizMoreLinks(){return[['cashflow','≋','Cash-flow forecast','Weekly inflows, outflows and projected balance'],['collections','⏱','Collections','Overdue receivables, reminders and promises'],['paymentRun','⇶','Payment run','Batch approved bills and preview the cash impact'],['auditPack','⇩','Audit pack','Download the recorded trail as CSV'],['gst','%','GST workspace','Preview of output tax, ITC and review checklist (no filing)'],['reconcile','⇄','Reconciliation','Match bank statement lines to open invoices and bills']]}
+function bizTitles(){return{cashflow:'Cash-flow forecast',collections:'Collections',paymentRun:'Payment run',auditPack:'Audit pack',gst:'GST',reconcile:'Reconciliation'}}
+function bizViews(){return{cashflow:bizCashflowPage,collections:bizCollectionsPage,paymentRun:bizPaymentRunPage,auditPack:bizAuditPage,gst:gstPage,reconcile:reconPage}}
 const biz={cache:{},stale:{},pending:{},err:{},days:60,lateBy:0,lateWho:'',editOpening:false,colBucket:'',openInv:'',tone:{},draft:{},promise:{},sel:null,strategy:'by_due',payDate:'',preview:null,previewKey:'',notif:{items:[],unread:0},notifOpen:false,notifRole:null};
 const bq=()=>`org=${encodeURIComponent(me().org)}&role=${encodeURIComponent(role)}`;
 const bizShort=n=>{const v=Number(n||0),a=Math.abs(v),s=v<0?'−':'';if(a>=1e7)return s+'₹'+(a/1e7).toFixed(2).replace(/\.?0+$/,'')+'Cr';if(a>=1e5)return s+'₹'+(a/1e5).toFixed(1).replace(/\.0$/,'')+'L';if(a>=1e3)return s+'₹'+Math.round(a/1e3)+'k';return s+'₹'+Math.round(a)};
@@ -1017,6 +1017,47 @@ function bizAuditPage(){
  const counts={};bizCsvRows(d.csv,100000).slice(1).forEach(r=>{counts[r[1]]=(counts[r[1]]||0)+1});
  return `${intro}<div class="metrics">${metric('Rows',d.rows,'Recorded events in the pack','▤')}${metric('Invoice events',counts.invoice||0,'Status, comments, reminders','◷')}${metric('Bill steps',counts.bill||0,'Receipt, approval, scheduling','▣')}${metric('Payment runs',counts.payment_run||0,'Simulated batches','⇶')}</div><section class="card panel">${panelTitle('Preview · first 12 rows',`<span class="subtle">${esc(d.filename)}</span>`)}<div class="table-wrap"><table class="table biz-audit"><thead><tr>${hd.map(h=>`<th>${esc(h.replace(/_/g,' '))}</th>`).join('')}</tr></thead><tbody>${body.map(r=>`<tr>${r.map(c=>`<td>${esc(c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div><p class="subtle biz-note">${esc(d.note)} Prepared for ${esc(d.generated_by)}. Cells that start with = + − @ are prefixed so spreadsheets do not run them.</p></section>`;
 }
+// gst: GST workspace preview (no filing). Data from /api/gst; CSV built in the browser from that data.
+const gst={month:''};
+function gstMonths(){const t=new Date(),out=[];let y=t.getFullYear(),m=t.getMonth()+1;for(let k=0;k<6;k++){out.push(y+'-'+String(m).padStart(2,'0'));if(--m===0){m=12;y--}}return out}
+const gstMonthLabel=ym=>{const[y,m]=ym.split('-').map(Number);return new Date(y,m-1,1).toLocaleDateString('en-IN',{month:'short',year:'numeric'})};
+const gstKey=()=>'gst'+(gst.month||gstMonths()[0]);
+function gstCsv(d){
+ const r=[['InvoiceOS GST summary (preview, no filing: nothing is submitted to the GST portal)'],['Business',d.org_name],['Month',d.month],['Amounts in INR'],[],
+  ['Summary'],['Output tax',d.summary.output_tax],['Input tax credit (ITC)',d.summary.itc],[d.summary.net_state==='credit'?'Credit carried forward':'Net GST payable',d.summary.net],['ITC at risk (flagged bills)',d.summary.itc_at_risk],[],
+  ['Tax split','Taxable value','CGST','SGST','IGST','Total tax'],['Output',...['taxable','cgst','sgst','igst','tax'].map(k=>d.split.output[k])],['Input (ITC)',...['taxable','cgst','sgst','igst','tax'].map(k=>d.split.input[k])],[],
+  ['Rate-wise','Rate %','Output taxable','Output tax','Input taxable','Input tax'],...d.rates.map(x=>['',x.rate,x.out_taxable,x.out_tax,x.in_taxable,x.in_tax]),[],
+  ['Output invoices','Invoice','Customer','Date','Status','Rate %','Taxable','CGST','SGST','IGST','Tax'],...d.output_invoices.map(x=>['',x.id,x.party,x.date,x.status,x.rate,x.taxable,x.cgst,x.sgst,x.igst,x.tax]),[],
+  ['ITC match','Bill','Supplier','Supplier ref','Linked invoice','Bill amount','Invoice amount','Rate %','Rate basis','Tax (ITC)','Result','Reason'],...d.itc.map(x=>['',x.id,x.vendor,x.ref,x.invoice_id,x.bill_amount,x.invoice_amount??'',x.rate,x.rate_basis,x.tax,x.match==='ok'?'Matched':'Flagged',x.reasons.join('; ')]),[],
+  ['Ready for review checklist'],...d.checklist.map(c=>[c.label,c.state==='pass'?'Pass':'Review',c.detail]),[],...d.notes.map(n=>['Note',n])];
+ const cell=v=>{let s=String(v??'');if(/^[=+\-@]/.test(s)&&isNaN(Number(s)))s="'"+s;return /[",\n]/.test(s)?'"'+s.replaceAll('"','""')+'"':s};
+ return '﻿'+r.map(x=>x.map(cell).join(',')).join('\r\n')+'\r\n';
+}
+function gstPage(){
+ if(!bizCan('gst'))return bizNoAccess('GST workspace');
+ const month=gst.month||gstMonths()[0],key='gst'+month,d=bizGet(key,`/api/gst?${bq()}&month=${month}`);
+ const seg=`<div class="biz-seg" role="group" aria-label="Month">${gstMonths().map(m=>`<button type="button" class="biz-seg-btn${m===month?' on':''}" data-gst="month" data-arg="${m}" aria-pressed="${m===month}">${esc(gstMonthLabel(m))}</button>`).join('')}</div>`;
+ const intro=head('COMPLIANCE · GST','GST workspace','Output tax, input tax credit and what is still open before a return could be prepared, computed from invoices and bills in this workspace.',seg);
+ const banner=`<div class="card panel gst-banner" role="note"><span class="status s-pending">Preview, no filing</span><span>Nothing is submitted to the GST portal. Fictional demo data.</span></div>`;
+ if(!d)return intro+banner+bizWait(key,'GST workspace');
+ const s=d.summary,N=v=>cash(v),sp=d.split;
+ const netLabel=s.net_state==='credit'?'Credit carried forward':'Net GST payable';
+ const tiles=`<div class="metrics">${metric('Output tax',N(s.output_tax),`${s.output_count} invoice${s.output_count===1?'':'s'} issued`,'↗')}${metric('Input tax credit',N(s.itc),`${s.input_count} bill${s.input_count===1?'':'s'} received`,'↘')}${metric(netLabel,N(s.net),s.net_state==='nil'?'Nothing due this month':s.net_state==='credit'?'ITC exceeds output tax':'Output tax less ITC','₹',s.net_state==='payable'&&s.net>0)}${metric('ITC at risk',N(s.itc_at_risk),s.itc_at_risk?'On flagged bills, see ITC match':'No flagged bills','!',s.itc_at_risk>0)}</div>`;
+ const splitRow=(l,t)=>`<tr><td><b>${l}</b></td><td class="num">${N(t.taxable)}</td><td class="num">${N(t.cgst)}</td><td class="num">${N(t.sgst)}</td><td class="num">${N(t.igst)}</td><td class="num strong">${N(t.tax)}</td></tr>`;
+ const split=`<section class="card panel">${panelTitle('Tax split · CGST, SGST, IGST')}<div class="table-wrap"><table class="table gst-table"><thead><tr><th>Side</th><th class="num">Taxable value</th><th class="num">CGST</th><th class="num">SGST</th><th class="num">IGST</th><th class="num">Total tax</th></tr></thead><tbody>${splitRow('Output',sp.output)}${splitRow('Input (ITC)',sp.input)}</tbody></table></div><p class="subtle biz-note">Same state code in both GSTINs (first two digits) splits CGST and SGST equally. A different state is IGST.</p></section>`;
+ const rateRows=d.rates.map(x=>`<tr><td><b>${x.rate}%</b></td><td class="num">${N(x.out_taxable)}</td><td class="num">${N(x.out_tax)}</td><td class="num">${N(x.in_taxable)}</td><td class="num">${N(x.in_tax)}</td></tr>`).join('');
+ const rates=`<section class="card panel">${panelTitle('Rate-wise summary')}<div class="table-wrap"><table class="table gst-table"><thead><tr><th>Rate</th><th class="num">Output taxable</th><th class="num">Output tax</th><th class="num">Input taxable</th><th class="num">Input tax</th></tr></thead><tbody>${rateRows}</tbody></table></div><p class="subtle biz-note">HSN/SAC codes are not held in this demo data, so there is no HSN summary.</p></section>`;
+ const itcRows=d.itc.map(x=>`<tr><td><b>${esc(x.id)}</b><small class="biz-sub">${esc(x.status)}</small></td><td>${esc(x.vendor)}<small class="biz-sub">${esc(x.ref)}${x.invoice_id&&x.invoice_id.toLowerCase()!==String(x.ref).toLowerCase()?' · '+esc(x.invoice_id):''}</small></td><td class="num">${N(x.bill_amount)}<small class="biz-sub">${x.invoice_amount==null?'no invoice':N(x.invoice_amount)+' invoice'}</small></td><td class="num">${N(x.tax)}<small class="biz-sub">${x.rate}%${x.rate_basis==='assumed'?' assumed':''}</small></td><td>${x.match==='ok'?bizTag('Matched','paid'):bizTag('Flagged','overdue')}${x.reasons.map(r=>`<small class="biz-sub gst-reason">${esc(r)}</small>`).join('')}</td></tr>`).join('');
+ const itc=`<section class="card panel">${panelTitle('ITC match · bills against supplier invoices',`<span class="subtle">${d.itc.filter(x=>x.match==='ok').length} of ${d.itc.length} matched</span>`)}${d.itc.length?`<div class="table-wrap"><table class="table gst-table gst-itc"><thead><tr><th>Bill</th><th>Supplier</th><th class="num">Bill amount</th><th class="num">ITC</th><th>Result</th></tr></thead><tbody>${itcRows}</tbody></table></div>`:'<p class="empty">No bills received in this month.</p>'}<p class="subtle biz-note">A bill matches when its supplier invoice id equals the bill reference, the invoice has been Sent, the totals agree and both GSTINs are present.</p></section>`;
+ const check=`<section class="card panel gst-check">${panelTitle('Ready for review',`${d.ready?bizTag('All checks passed','paid'):bizTag('Needs attention','pending')}`)}<ul class="gst-checks">${d.checklist.map(c=>`<li class="${c.state}"><span class="gst-ico" aria-hidden="true">${c.state==='pass'?'✓':'!'}</span><span><b>${esc(c.label)}</b><small>${esc(c.detail)}</small></span>${bizTag(c.state==='pass'?'Pass':'Review',c.state==='pass'?'paid':'pending')}</li>`).join('')}</ul></section>`;
+ const dl=`<div class="gst-foot"><button class="btn primary" data-gst="csv">⇩ Download summary (CSV)</button><span class="subtle">Built in your browser from the figures on this page. Nothing is filed.</span></div>`;
+ const notes=`<section class="card panel"><ul class="gst-notes">${d.notes.slice(1,3).map(n=>`<li>${esc(n)}</li>`).join('')}</ul></section>`;
+ return `${intro}${banner}${tiles}<div class="gst-two">${split}${rates}</div>${itc}${check}${notes}${dl}`;
+}
+document.addEventListener('click',e=>{const t=e.target.closest('[data-gst]');if(!t)return;const a=t.dataset.gst;
+ if(a==='month'){gst.month=t.dataset.arg;render();return}
+ if(a==='csv'){const d=biz.cache[gstKey()]||biz.stale[gstKey()];if(d){bizDownload(`invoiceos-gst-summary-${d.org}-${d.month}.csv`,gstCsv(d));toast('GST summary downloaded. Preview only, nothing was filed.','success')}}
+});
 function bizDownload(name,text){const blob=new Blob([text],{type:'text/csv;charset=utf-8'}),url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),1000)}
 
 /* ---- events ------------------------------------------------------- */
@@ -1750,3 +1791,97 @@ document.addEventListener('keydown',e=>{
 });
 document.addEventListener('change',e=>{const x=e.target.closest&&e.target.closest('[data-l3-weave]');if(x)l3UpdateWeave(x.closest('section'))});
 document.addEventListener('input',e=>{const q=e.target.closest&&e.target.closest('[data-l3-q]');if(q)l3Filter(q.closest('section'))});
+
+// reconciliation: bank statement matching (demo, no bank connection). Server: /api/reconcile/suggest and /confirm.
+const rec={role:'',text:'',res:null,done:{},skip:{},busy:false,note:''};
+const RECON_ROLES=['owner','finance_manager','ar','ap','approver','auditor'];
+const reconCan=()=>RECON_ROLES.includes(role);
+const reconMonths={jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12};
+function reconDate(s){s=String(s||'').trim();let m=s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/),y,mo,d;if(m){y=+m[1];mo=+m[2];d=+m[3]}else if(m=s.match(/^(\d{1,2})[\/.\- ]+(\d{1,2})[\/.\- ]+(\d{2,4})$/)){d=+m[1];mo=+m[2];y=+m[3]}else if(m=s.match(/^(\d{1,2})[\/.\- ]+([A-Za-z]{3})[a-z]*[\/.\- ,]+(\d{2,4})$/)){d=+m[1];mo=reconMonths[m[2].toLowerCase()]||0;y=+m[3]}else return'';if(y<100)y+=2000;const t=new Date(y,mo-1,d);if(!mo||t.getFullYear()!==y||t.getMonth()!==mo-1||t.getDate()!==d)return'';return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`}
+function reconNum(v){let s=String(v??'').trim();if(!s||s==='-')return 0;s=s.replace(/₹|INR|Rs\.?|,|\s|\b(?:Dr|Cr)\.?$/gi,'').replace(/^\((.*)\)$/,'$1');const n=Number(s);return Number.isFinite(n)?Math.abs(n):NaN}
+function reconSplit(line,d){const o=[];let c='',q=false;for(let i=0;i<line.length;i++){const ch=line[i];if(q){if(ch==='"'){if(line[i+1]==='"'){c+='"';i++}else q=false}else c+=ch}else if(ch==='"')q=true;else if(ch===d){o.push(c);c=''}else c+=ch}o.push(c);return o.map(x=>x.trim())}
+function reconParse(text){
+ const rows=String(text||'').replace(/^﻿/,'').split(/\r?\n/).filter(r=>r.trim());const out={lines:[],bad:[],cut:false};if(!rows.length)return out;
+ const d=rows[0].includes('\t')?'\t':(!rows[0].includes(',')&&rows[0].includes(';')?';':',');
+ let first=reconSplit(rows[0],d),col={date:0,desc:1,debit:2,credit:3},body=rows;
+ if(first.some(c=>/date/i.test(c))&&first.some(c=>/debit|credit|withdraw|deposit|amount|particular|narrat|descr/i.test(c))){
+  body=rows.slice(1);const f=re=>first.findIndex(c=>re.test(c));
+  const m={date:f(/date/i),desc:f(/desc|narrat|partic|remark|detail/i),debit:f(/debit|withdraw|\bdr\b/i),credit:f(/credit|deposit|\bcr\b/i)};
+  if(m.date<0||(m.debit<0&&m.credit<0)){out.bad.push('Header needs Date plus Debit and Credit columns');return out}
+  col={...col,...Object.fromEntries(Object.entries(m).filter(([,v])=>v>=0))};if(m.desc<0)col.desc=-1}
+ body.forEach((r,i)=>{if(out.lines.length>=200){out.cut=true;return}const c=reconSplit(r,d),n=i+(body===rows?1:2);
+  const date=reconDate(c[col.date]),dr=reconNum(c[col.debit]),cr=reconNum(c[col.credit]);
+  if(!date){out.bad.push(`Row ${n}: date not recognised`);return}
+  if(Number.isNaN(dr)||Number.isNaN(cr)||(dr>0)===(cr>0)){out.bad.push(`Row ${n}: needs one debit or one credit amount`);return}
+  out.lines.push({date,description:String(col.desc<0?'':c[col.desc]||'').slice(0,200),...(cr>0?{credit:cr}:{debit:dr})})});
+ return out}
+function reconSample(){
+ const org=me().org,t=new Date(),fmt=o=>{const x=new Date(t.getFullYear(),t.getMonth(),t.getDate()-o);return `${String(x.getDate()).padStart(2,'0')}/${String(x.getMonth()+1).padStart(2,'0')}/${x.getFullYear()}`};
+ const nm=id=>(company(id).name||'').split(' ')[0].toUpperCase(),left=i=>Math.round((Number(i.total)-Number(i.amount_paid||0))*100)/100,tail=r=>(String(r).match(/\d{3,}/g)||[''] ).pop();
+ const byDue=(a,b)=>String(a.due_date).localeCompare(String(b.due_date));
+ const ar=state.invoices.filter(i=>i.supplier===org&&['Overdue','Approved','Partially paid'].includes(i.status)).sort(byDue),sent=state.invoices.filter(i=>i.supplier===org&&['Sent','Viewed'].includes(i.status)).sort(byDue);
+ const ap=state.bills.filter(b=>b.buyer===org&&['Approved','Scheduled'].includes(b.status)).sort(byDue);
+ const q=n=>`"₹${n.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2})}"`,L=[];let bal=1250000;
+ const add=(o,desc,dr,cr)=>{bal+=(cr||0)-(dr||0);L.push(`${fmt(o)},${desc.replace(/,/g,' ')},${dr?q(dr):''},${cr?q(cr):''},${q(bal)}`)};
+ if(ar[0])add(1,`NEFT CR ${nm(ar[0].customer)} ${ar[0].id}`,0,left(ar[0]));
+ if(ar[1])add(2,`IMPS/${tail(ar[1].id)}/${nm(ar[1].customer)} payment`,0,left(ar[1]));
+ if(ar[2]){const a=left(ar[2]);add(3,`RTGS ${nm(ar[2].customer)} ${ar[2].id} NET OF CHGS`,0,a>1000?Math.round((a-118)*100)/100:a)}
+ if(ar[0])add(1,`NEFT CR ${nm(ar[0].customer)} ${ar[0].id}`,0,left(ar[0]));
+ if(sent[0])add(4,`NEFT CR ${nm(sent[0].customer)} ${sent[0].id}`,0,left(sent[0]));
+ if(ap[0])add(2,`NEFT DR ${nm(ap[0].vendor)} ${ap[0].vendor_invoice_id}`,Number(ap[0].amount),0);
+ if(ap[1])add(5,`RTGS/${tail(ap[1].vendor_invoice_id)}/${nm(ap[1].vendor)}`,Number(ap[1].amount),0);
+ add(6,'UPI/CR/Razorpay settlement 7741',0,47350);add(7,'ACH D- OFFICE RENT NOV',85000,0);
+ return 'Date,Description,Debit,Credit,Balance\n'+L.join('\n')}
+const reconLine=r=>({date:r.date,description:r.description,...(r.direction==='credit'?{credit:r.amount}:{debit:r.amount})});
+const reconRows=()=>(rec.res?rec.res.lines:[]);
+const reconPending=r=>r.state==='Suggested'&&!rec.done[r.idx]&&!rec.skip[r.idx];
+const reconConf={High:'approved',Medium:'pending',Low:'sent'};
+function reconRow(r){
+ const s=r.suggestion,done=rec.done[r.idx],skip=rec.skip[r.idx],ro=role==='auditor',cr=r.direction==='credit';
+ let match='<span class="subtle">'+esc(r.note||'')+'</span>',conf='',act='';
+ if(s)match=`<b>${esc(s.id)}</b> <small class="biz-sub">${esc(s.party)} · ${esc(s.status)} · due ${esc(bizD(s.due_date))} · ${cash(s.due_amount)}</small><small class="recon-why">${esc(s.reason)}</small>${!s.confirmable?`<small class="recon-block">${esc(s.block_reason)}</small>`:''}`;
+ if(s)conf=bizTag(s.confidence,reconConf[s.confidence]||'sent');
+ if(done)act=bizTag('Reconciled · Paid','paid');
+ else if(skip)act=`<span class="subtle">Skipped</span> <button class="text-link" data-recon="unskip" data-arg="${r.idx}">Undo</button>`;
+ else if(r.state==='Suggested')act=ro?'<span class="subtle">Read only</span>':`<span class="recon-acts">${s.confirmable?`<button class="btn small primary" data-recon="confirm" data-arg="${r.idx}" ${rec.busy?'disabled':''}>Confirm</button>`:''}<button class="btn small" data-recon="skip" data-arg="${r.idx}">Skip</button></span>`;
+ else act=bizTag(r.state,r.state==='Duplicate'?'pending':r.state==='Reconciled'?'paid':'review');
+ return `<tr class="${done?'recon-done':''}"><td data-l="Date">${esc(bizD(r.date))}</td><td data-l="Bank line"><b>${esc(r.description||'(no description)')}</b></td><td data-l="Amount" class="num strong ${cr?'recon-cr':'recon-dr'}">${cr?'+':'−'}${cash(r.amount)}<small class="biz-sub">${cr?'Credit':'Debit'}</small></td><td data-l="Suggested match">${match}</td><td data-l="Confidence">${conf||'—'}</td><td data-l="Action">${act}</td></tr>`}
+function reconPage(){
+ if(!reconCan())return bizNoAccess('Reconciliation');
+ if(rec.role!==role){Object.assign(rec,{role,text:'',res:null,done:{},skip:{},busy:false,note:''})}
+ const ro=role==='auditor',rows=reconRows(),doneRows=rows.filter(r=>rec.done[r.idx]),pending=rows.filter(reconPending);
+ const matched=doneRows.reduce((n,r)=>n+r.amount,0),total=rows.reduce((n,r)=>n+r.amount,0),unm=rows.length-doneRows.length-pending.length;
+ const high=pending.filter(r=>r.suggestion.confidence==='High'&&r.suggestion.confirmable).length;
+ const actions=`${high&&!ro?`<button class="btn primary" data-recon="confirm-high" ${rec.busy?'disabled':''}>Confirm all high-confidence (${high})</button>`:''}`;
+ const tiles=`<div class="metrics">${metric('Matched',cash(matched),`${doneRows.length} line${doneRows.length===1?'':'s'} reconciled`,'✓')}${metric('To review',pending.length,'Suggestions waiting for you','◷')}${metric('Unmatched',unm,'Duplicates, skipped or no match','!',unm>0&&!!rows.length)}${metric('Difference',cash(Math.max(0,total-matched)),'Statement total not yet matched','≠',!!rows.length&&total-matched>0.004)}</div>`;
+ const input=`<section class="card panel recon-input">${panelTitle('Bank statement','<span class="recon-demo"><span class="status s-pending">Demo</span> No real bank connection</span>')}<p class="subtle">Paste statement CSV (columns date, description, debit, credit; extra columns, ₹ and commas inside quotes are fine) or load a sample built from your open invoices and bills. Parsed in your browser; up to 200 lines.</p><label class="sr-only" for="reconText">Statement CSV</label><textarea id="reconText" class="recon-text" rows="6" spellcheck="false" placeholder="Date,Description,Debit,Credit&#10;12/11/2026,NEFT CR ACME INV-2025-0001,,&quot;1,18,000.00&quot;">${esc(rec.text)}</textarea><div class="recon-bar"><button class="btn" data-recon="sample">Load sample statement</button><label class="btn recon-file">Choose CSV file<input id="reconFile" type="file" accept=".csv,.txt,text/csv,text/plain" hidden></label><button class="btn primary" data-recon="match" ${rec.busy?'disabled':''}>${rec.busy?'Matching…':'Find matches'}</button>${rec.text||rec.res?'<button class="text-link" data-recon="clear">Clear</button>':''}</div>${rec.note?`<p class="recon-note" role="status">${esc(rec.note)}</p>`:''}</section>`;
+ const hist=(biz.cache.recHist||biz.stale.recHist)?.items||[];
+ const results=rec.res?`<section class="card panel">${panelTitle('Statement lines',`<span class="subtle">${rows.length} lines · ${rec.res.summary.suggested} suggested</span>`)}<div class="table-wrap"><table class="table recon-table"><thead><tr><th>Date</th><th>Bank line</th><th class="num">Amount</th><th>Suggested match</th><th>Confidence</th><th>Action</th></tr></thead><tbody>${rows.map(reconRow).join('')}</tbody></table></div></section>`:'';
+ const log=hist.length?`<section class="card panel">${panelTitle('Reconciled earlier','<span class="subtle">Demo log</span>')}<div class="table-wrap"><table class="table recon-table"><thead><tr><th>When</th><th>Bank line</th><th class="num">Amount</th><th>Matched</th><th>By</th></tr></thead><tbody>${hist.slice(0,8).map(h=>`<tr><td data-l="When">${esc(bizD(String(h.created_at).slice(0,10)))}</td><td data-l="Bank line">${esc(h.line_desc||'—')}</td><td data-l="Amount" class="num strong">${h.direction==='credit'?'+':'−'}${cash(h.amount)}</td><td data-l="Matched"><b>${esc(h.matched_id)}</b></td><td data-l="By">${esc(h.created_by||'')}</td></tr>`).join('')}</tbody></table></div></section>`:'';
+ if(!hist.length&&!biz.pending.recHist&&!biz.err.recHist)bizGet('recHist',`/api/reconcile?${bq()}`);
+ return `${head('MONEY · RECONCILIATION','Bank reconciliation',ro?'Read-only view: you can see suggested matches but only finance roles can confirm them.':'Match bank statement lines to open invoices and bills. Confirming marks the item Paid through the normal status rules.',actions)}${tiles}${input}${results}${log}`}
+async function reconMatch(){
+ const p=reconParse(rec.text);if(!p.lines.length){rec.note=p.bad[0]||'Paste or load a statement first.';render();return}
+ rec.busy=true;rec.note='';render();
+ try{const d=await api('/api/reconcile/suggest',{method:'POST',body:bizBody({org:me().org,lines:p.lines})});rec.res=d;rec.done={};rec.skip={};
+  rec.note=[p.cut?'Only the first 200 lines were used.':'',p.bad.length?`${p.bad.length} row${p.bad.length===1?'':'s'} skipped (${p.bad[0]}).`:''].filter(Boolean).join(' ')}
+ catch(err){toast(err.message,'error');rec.note=err.message}
+ rec.busy=false;render()}
+async function reconConfirmOne(r){const s=r.suggestion;await api('/api/reconcile/confirm',{method:'POST',body:bizBody({org:me().org,line:reconLine(r),match_type:s.type,match_id:s.id})});rec.done[r.idx]=true}
+async function reconConfirm(list){
+ if(rec.busy||!list.length)return;rec.busy=true;render();let n=0;
+ try{for(const r of list){await reconConfirmOne(r);n++}}catch(err){toast(err.message,'error');rec.note=err.message}
+ rec.busy=false;delete biz.cache.recHist;if(n){await refresh().catch(()=>{});toast(`${n} item${n===1?'':'s'} marked Paid from the statement (demo, no money moved)`,'success')}else render()}
+document.addEventListener('click',e=>{
+ const t=e.target.closest&&e.target.closest('[data-recon]');if(!t||page!=='reconcile')return;const a=t.dataset.recon,i=+t.dataset.arg;
+ if(a==='sample'){rec.text=reconSample();rec.res=null;rec.note='Sample statement loaded from your open invoices and bills. Press Find matches.';render();return}
+ if(a==='match'){reconMatch();return}
+ if(a==='clear'){rec.text='';rec.res=null;rec.done={};rec.skip={};rec.note='';render();return}
+ if(a==='skip'){rec.skip[i]=true;render();return}
+ if(a==='unskip'){delete rec.skip[i];render();return}
+ if(a==='confirm'){const r=reconRows().find(x=>x.idx===i);if(r)reconConfirm([r]);return}
+ if(a==='confirm-high'){reconConfirm(reconRows().filter(r=>reconPending(r)&&r.suggestion.confidence==='High'&&r.suggestion.confirmable))}
+});
+document.addEventListener('input',e=>{if(e.target.id==='reconText')rec.text=e.target.value});
+document.addEventListener('change',e=>{if(e.target.id!=='reconFile'||!e.target.files[0])return;const f=e.target.files[0];if(f.size>90000){toast('That file is over 90 KB. Use a shorter statement for the demo.','error');return}f.text().then(x=>{rec.text=x;rec.res=null;rec.note=`Loaded ${f.name}. Press Find matches.`;render()})});
+// end reconciliation
