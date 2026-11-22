@@ -1,0 +1,9 @@
+invoiceos.sqlite3*
+*.zip
+orb-extracted
+__pycache__
+supabase
+*.md
+*.bak*
+server.py
+.git
