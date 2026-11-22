@@ -66,6 +66,13 @@ CREATE TABLE IF NOT EXISTS bank_reconciliations (id TEXT PRIMARY KEY, org TEXT N
   status TEXT NOT NULL DEFAULT 'Matched' CHECK (status IN ('Matched','Skipped')), created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_recon_match ON bank_reconciliations(org, matched_type, matched_id) WHERE status='Matched';
 -- END RECONCILIATION
+-- ASSISTANT
+CREATE TABLE IF NOT EXISTS ai_action (id TEXT PRIMARY KEY, org TEXT NOT NULL, actor TEXT NOT NULL, role TEXT NOT NULL,
+  input_text TEXT NOT NULL DEFAULT '', intent TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}',
+  status TEXT NOT NULL DEFAULT 'Proposed' CHECK (status IN ('Proposed','Confirmed','Cancelled','Failed')),
+  result_text TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, decided_at TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS idx_ai_action_org_created ON ai_action(org, created_at);
+-- END ASSISTANT
 """
 # Columns added after the first release; _migrate() adds them to older local databases.
 ADDED_COLUMNS = {
@@ -74,7 +81,7 @@ ADDED_COLUMNS = {
               ("discount_by", "TEXT DEFAULT ''"), ("payment_run_id", "TEXT DEFAULT ''")],
 }
 TABLES = {"businesses", "invoices", "activity", "comments", "bills", "bill_activity", "connections", "calendar_events", "staff",
-          "notifications", "reminders", "payment_runs", "payment_run_items", "org_settings", "bank_reconciliations"}
+          "notifications", "reminders", "payment_runs", "payment_run_items", "org_settings", "bank_reconciliations", "ai_action"}
 COLUMN_RE = re.compile(r"[a-z_]+")
 
 
@@ -476,6 +483,31 @@ def _seed_business(con):
                     (iid, "apex", "Paid", "Payment recorded (demo)", stamp(off, "11:20")))
 
 
+# ASSISTANT seed: a little fictional history so the activity page has shape (only states that match the seeded records).
+def _seed_assistant(con):
+    if con.execute("SELECT 1 FROM ai_action LIMIT 1").fetchone():
+        return
+    today = datetime.date.today()
+    st = lambda off, t: f"{(today + datetime.timedelta(days=off)).isoformat()}T{t}:00"
+    rows = [  # org, actor, role, text, intent, kind, summary, status, result, offset, time
+        ("northstar", "northstar", "finance_manager", "remind overdue customers", "remind_overdue", "remind_overdue",
+         "Send reminders on overdue invoices", "Confirmed", "3 demo reminders recorded. Nothing was emailed.", -6, "10:40"),
+        ("northstar", "northstar", "ar", "remind overdue customers", "remind_overdue", "remind_overdue",
+         "Send reminders on overdue invoices", "Confirmed", "2 demo reminders recorded. Nothing was emailed.", -3, "10:40"),
+        ("northstar", "northstar", "ar", "mark INV-2025-0841 as paid", "mark_paid", "invoice_paid",
+         "Mark INV-2025-0841 as Paid", "Confirmed", "INV-2025-0841 marked Paid (demo, no money moved).", -3, "11:20"),
+        ("northstar", "northstar", "owner", "mark INV-2025-0839 as paid", "mark_paid", "invoice_paid",
+         "Mark INV-2025-0839 as Paid", "Cancelled", "", -2, "16:05"),
+        ("meridian", "meridian", "approver", "approve BILL-4509", "approve_bill", "bill_approve",
+         "Approve BILL-4509", "Confirmed", "BILL-4509 approved.", -4, "12:10"),
+    ]
+    for i, (org, actor, role, text, intent, kind, summary, status, result, off, t) in enumerate(rows, 1):
+        con.execute("INSERT INTO ai_action (id,org,actor,role,input_text,intent,kind,payload,status,result_text,created_at,decided_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (f"ai_seed_{i}", org, actor, role, text, intent, kind, json.dumps({"summary": summary}), status, result,
+                     st(off, t), st(off, t[:3] + "42")))
+
+
 class LocalDB:
     def __init__(self):
         global _initialised
@@ -489,6 +521,7 @@ class LocalDB:
                     _seed(con)
                     _seed_calendar(con)
                     _seed_business(con)
+                    _seed_assistant(con)
                     con.commit()
                 finally:
                     con.close()

@@ -28,7 +28,7 @@ const requestedRole=demoRoute?(demoParams.get('role')||''):'';
 if(requestedRole&&profiles[requestedRole]){role=requestedRole;store.set('invoiceos_role',role)}
 const demoPageParam=demoRoute?(demoParams.get('page')||''):'';
 const demoRecordId=demoRoute?(demoParams.get('id')||''):'';
-const demoStartPages=new Set(['overview','invoices','bills','approvals','disputes','connections','payments','team','activity','insights','more','builder','billUpload','portal','calendar','cashflow','collections','paymentRun','auditPack','gst','reconcile']);
+const demoStartPages=new Set(['overview','invoices','bills','approvals','disputes','connections','payments','team','activity','insights','more','builder','billUpload','portal','calendar','cashflow','collections','paymentRun','auditPack','gst','reconcile','assistant','aiActivity']);
 let page=demoPick?'roles':demoRoute?'boot':'landing',selectedId=demoRecordId,state={businesses:[],invoices:[],comments:[],activity:[],bill_activity:[],bills:[],connections:[],calendar_events:[],staff:[]},toastTimer;
 const me=()=>profiles[role], company=id=>state.businesses.find(b=>b.id===id)||{id,name:id||'Business',gstin:'',city:''};
 function portalLabel(){return me().side==='buyer'?'Buyer portal':'Supplier portal'}
@@ -575,7 +575,7 @@ function cmdkCommands(query){
  out.push({type:'action',id:'action:refresh',title:'Refresh workspace',subtitle:'Reload records from the local API',glyph:'↻',action:'refresh',hay:'refresh reload sync api'});
  out.push({type:'action',id:'action:roles',title:'Switch role',subtitle:'Choose a different permission view',glyph:'♙',action:'roles',hay:'switch role permissions view as'});
  out.push({type:'action',id:'action:landing',title:'Back to landing page',subtitle:'Return to the demo overview',glyph:'⌂',action:'landing',hay:'landing home overview demo'});
- return needle?out.filter(item=>item.hay.includes(needle)):out;
+ const res=needle?out.filter(item=>item.hay.includes(needle)):out;if(bizCan('assistant')&&!me().external)res.push({type:'action',id:'action:ask-ai',title:needle?`Ask the assistant: “${query.trim().slice(0,60)}”`:'Ask the assistant',subtitle:'Rule-based demo assistant · no external AI',glyph:'✦',action:'ask-assistant',q:needle?query.trim().slice(0,300):'',hay:''});return res;
 }
 function cmdkParty(invoice){return company(me().side==='supplier'?invoice.customer:invoice.supplier).name}
 function cmdkLocal(query){
@@ -657,6 +657,7 @@ function cmdkRun(item){
  else if(item.action==='orb'){setTimeout(()=>window.InvoiceOSOrb?.open(),140)}
  else if(item.action==='roles'){page='roles';render()}
  else if(item.action==='landing'){page='landing';render()}
+ else if(item.action==='ask-assistant'){aiOpen(item.q)}
 }
 function cmdkStep(delta){
  if(!cmdkState.items.length)return;
@@ -833,14 +834,14 @@ document.addEventListener('submit',async e=>{
    Figures come from the API, computed from stored rows. Nothing here
    emails anyone, files anything or moves money.
    =================================================================== */
-const BIZ_ACCESS={cashflow:['owner','finance_manager','auditor'],collections:['owner','finance_manager','ar'],paymentRun:['ap','approver'],auditPack:['auditor','owner','finance_manager'],gst:['owner','finance_manager','ar','ap','auditor'],reconcile:['owner','finance_manager','ar','ap','approver','auditor']};
+const BIZ_ACCESS={assistant:['owner','finance_manager','ar','ap','approver','auditor'],aiActivity:['owner','finance_manager','auditor'],cashflow:['owner','finance_manager','auditor'],collections:['owner','finance_manager','ar'],paymentRun:['ap','approver'],auditPack:['auditor','owner','finance_manager'],gst:['owner','finance_manager','ar','ap','auditor'],reconcile:['owner','finance_manager','ar','ap','approver','auditor']};
 const BIZ_INTERNAL=['owner','finance_manager','ar','ap','approver','auditor'];
 const bizInternal=()=>BIZ_INTERNAL.includes(role);
 const bizCan=p=>(BIZ_ACCESS[p]||[]).includes(role);
 function bizHiddenPages(){const h=new Set();for(const[k,r]of Object.entries(BIZ_ACCESS))if(!r.includes(role))h.add(k);return h}
-function bizMoreLinks(){return[['cashflow','≋','Cash-flow forecast','Weekly inflows, outflows and projected balance'],['collections','⏱','Collections','Overdue receivables, reminders and promises'],['paymentRun','⇶','Payment run','Batch approved bills and preview the cash impact'],['auditPack','⇩','Audit pack','Download the recorded trail as CSV'],['gst','%','GST workspace','Preview of output tax, ITC and review checklist (no filing)'],['reconcile','⇄','Reconciliation','Match bank statement lines to open invoices and bills']]}
-function bizTitles(){return{cashflow:'Cash-flow forecast',collections:'Collections',paymentRun:'Payment run',auditPack:'Audit pack',gst:'GST',reconcile:'Reconciliation'}}
-function bizViews(){return{cashflow:bizCashflowPage,collections:bizCollectionsPage,paymentRun:bizPaymentRunPage,auditPack:bizAuditPage,gst:gstPage,reconcile:reconPage}}
+function bizMoreLinks(){return[['assistant','✦','Assistant','Ask questions or stage changes (rule-based demo, no external AI)'],['aiActivity','◷','Assistant activity','Every proposal the assistant staged and what happened to it'],['cashflow','≋','Cash-flow forecast','Weekly inflows, outflows and projected balance'],['collections','⏱','Collections','Overdue receivables, reminders and promises'],['paymentRun','⇶','Payment run','Batch approved bills and preview the cash impact'],['auditPack','⇩','Audit pack','Download the recorded trail as CSV'],['gst','%','GST workspace','Preview of output tax, ITC and review checklist (no filing)'],['reconcile','⇄','Reconciliation','Match bank statement lines to open invoices and bills']]}
+function bizTitles(){return{assistant:'Assistant',aiActivity:'Assistant activity',cashflow:'Cash-flow forecast',collections:'Collections',paymentRun:'Payment run',auditPack:'Audit pack',gst:'GST',reconcile:'Reconciliation'}}
+function bizViews(){return{assistant:aiPage,aiActivity:aiActivityPage,cashflow:bizCashflowPage,collections:bizCollectionsPage,paymentRun:bizPaymentRunPage,auditPack:bizAuditPage,gst:gstPage,reconcile:reconPage}}
 const biz={cache:{},stale:{},pending:{},err:{},days:60,lateBy:0,lateWho:'',editOpening:false,colBucket:'',openInv:'',tone:{},draft:{},promise:{},sel:null,strategy:'by_due',payDate:'',preview:null,previewKey:'',notif:{items:[],unread:0},notifOpen:false,notifRole:null};
 const bq=()=>`org=${encodeURIComponent(me().org)}&role=${encodeURIComponent(role)}`;
 const bizShort=n=>{const v=Number(n||0),a=Math.abs(v),s=v<0?'−':'';if(a>=1e7)return s+'₹'+(a/1e7).toFixed(2).replace(/\.?0+$/,'')+'Cr';if(a>=1e5)return s+'₹'+(a/1e5).toFixed(1).replace(/\.0$/,'')+'L';if(a>=1e3)return s+'₹'+Math.round(a/1e3)+'k';return s+'₹'+Math.round(a)};
@@ -1885,3 +1886,56 @@ document.addEventListener('click',e=>{
 document.addEventListener('input',e=>{if(e.target.id==='reconText')rec.text=e.target.value});
 document.addEventListener('change',e=>{if(e.target.id!=='reconFile'||!e.target.files[0])return;const f=e.target.files[0];if(f.size>90000){toast('That file is over 90 KB. Use a shorter statement for the demo.','error');return}f.text().then(x=>{rec.text=x;rec.res=null;rec.note=`Loaded ${f.name}. Press Find matches.`;render()})});
 // end reconciliation
+// assistant: rule-based demo assistant (Ask + staged changes) and its activity page. Server: /api/assistant/*. No external AI.
+const AI_LABEL='Demo assistant · rule-based, no external AI';
+const ai={role:'',msgs:[],busy:false,input:''};
+const aiSuggest=()=>role==='ap'||role==='approver'?['Bills needing approval','Which bills are due this week?','What is overdue?','Cash position','Schedule a meeting with Northstar tomorrow 3pm']:['Top 5 customers by sales','What is overdue?','Who owes me the most?','Cash position','Remind overdue customers','इस महीने कितनी बिक्री हुई?'];
+const aiBody=o=>JSON.stringify({role,org:me().org,actor:me().org,...o});
+const aiStatusCls={Proposed:'s-pending',Confirmed:'s-paid',Cancelled:'s-rejected',Failed:'s-overdue'};
+function aiFocus(){setTimeout(()=>{const l=$('#aiLog');if(l)l.scrollTop=l.scrollHeight;const i=$('#aiText');if(i&&page==='assistant')i.focus()},0)}
+function aiTable(t){if(!t||!t.rows||!t.rows.length)return '';return `<div class="table-wrap ai-table"><table class="table"><thead><tr>${t.columns.map((c,i)=>`<th${t.num.includes(i)?' class="num"':''}>${esc(c)}</th>`).join('')}</tr></thead><tbody>${t.rows.map(r=>`<tr>${r.map((c,i)=>`<td${t.num.includes(i)?' class="num"':''}>${esc(c)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`}
+function aiCard(c,mi,ci){
+ const can=(c.roles||[]).includes(role),st=c.state;
+ const foot=st==='pending'?`<div class="ai-actions"><button class="btn primary" data-ai="confirm" data-m="${mi}" data-c="${ci}" ${can&&!ai.busy?'':'disabled'}>Confirm</button><button class="btn" data-ai="cancel" data-m="${mi}" data-c="${ci}" ${ai.busy?'disabled':''}>Cancel</button>${can?'':`<span class="subtle">Your role cannot confirm this.</span>`}</div>`
+  :st==='working'?`<div class="ai-actions"><span class="subtle">Working…</span></div>`
+  :`<div class="ai-actions">${bizTag(st==='confirmed'?'Confirmed':st==='cancelled'?'Cancelled':'Failed',st==='confirmed'?'paid':st==='cancelled'?'rejected':'overdue')}<span class="subtle">${esc(c.msg||'')}</span></div>`;
+ return `<div class="ai-card"><b>${esc(c.title)}</b><small class="biz-sub">${esc(c.record)}</small><ul class="ai-changes">${(c.changes||[]).map(x=>`<li>${esc(x)}</li>`).join('')}</ul><p class="subtle">Who can confirm: ${esc((c.permitted||[]).join(', '))}. ${esc(c.note||'')}</p>${foot}</div>`}
+function aiMsg(m,mi){
+ if(m.who==='me')return `<div class="ai-msg me">${esc(m.text)}</div>`;
+ return `<div class="ai-msg bot"><small class="ai-who">${esc(AI_LABEL)}</small><p>${esc(m.text)}</p>${aiTable(m.table)}${(m.cards||[]).map((c,ci)=>aiCard(c,mi,ci)).join('')}${(m.suggestions||[]).length?`<div class="biz-seg ai-chips">${m.suggestions.map(s=>`<button type="button" class="biz-seg-btn" data-ai="chip" data-t="${esc(s)}">${esc(s)}</button>`).join('')}</div>`:''}</div>`}
+function aiPage(){
+ if(!bizCan('assistant'))return bizNoAccess('Assistant');
+ if(ai.role!==role){Object.assign(ai,{role,msgs:[],busy:false,input:''})}
+ const intro=head('WORKSPACE · ASSISTANT','Assistant','Ask about your invoices and bills, or have a change prepared. Changes only happen after you confirm.',`<span class="status s-pending">${esc(AI_LABEL)}</span>`);
+ const log=ai.msgs.length?ai.msgs.map(aiMsg).join(''):`<div class="ai-msg bot"><small class="ai-who">${esc(AI_LABEL)}</small><p>Hi. I match your words against a fixed set of questions and commands (English, Hindi and Hinglish). I am not an AI model. Try one of these:</p><div class="biz-seg ai-chips">${aiSuggest().map(s=>`<button type="button" class="biz-seg-btn" data-ai="chip" data-t="${esc(s)}">${esc(s)}</button>`).join('')}</div></div>`;
+ return `${intro}<section class="card panel ai-chat"><div class="ai-log" id="aiLog" role="log" aria-live="polite">${log}${ai.busy?'<div class="ai-msg bot"><span class="subtle">Thinking…</span></div>':''}</div><form class="ai-form" id="aiForm" autocomplete="off"><input id="aiText" class="ai-input" type="text" maxlength="300" placeholder="Ask a question or give a command…" aria-label="Message the assistant" value="${esc(ai.input)}"><button class="btn primary" type="submit" ${ai.busy?'disabled':''}>Send</button></form><p class="subtle">Rule-based demo. No external AI is called and nothing is changed without your confirmation.</p></section>`}
+async function aiAsk(text){
+ text=String(text||'').trim();if(!text||ai.busy)return;ai.msgs.push({who:'me',text});ai.input='';ai.busy=true;render();aiFocus();
+ try{const d=await api('/api/assistant/ask',{method:'POST',body:aiBody({text})});ai.msgs.push({who:'bot',text:d.answer_text,table:d.table,suggestions:d.suggestions,cards:(d.actions||[]).map(c=>({...c,state:'pending'}))})}
+ catch(err){ai.msgs.push({who:'bot',text:err.message,suggestions:[]})}
+ ai.busy=false;render();aiFocus()}
+function aiOpen(text){page='assistant';render();if(text)aiAsk(text);else aiFocus()}
+async function aiDecide(mi,ci,act){
+ const c=(ai.msgs[mi]||{cards:[]}).cards[ci];if(!c||c.state!=='pending'||ai.busy)return;ai.busy=true;c.state='working';render();
+ try{const d=await api('/api/assistant/'+act,{method:'POST',body:aiBody({id:c.id})});c.state=act==='confirm'?'confirmed':'cancelled';c.msg=act==='confirm'?d.result_text:'Cancelled. Nothing was changed.';ai.busy=false;if(act==='confirm'){toast('Done (demo). Records updated.','success');await refresh()}else{bizInvalidate();render()}}
+ catch(err){c.state='failed';c.msg=err.message;ai.busy=false;bizInvalidate();render()}
+ aiFocus()}
+function aiActivityPage(){
+ if(!bizCan('aiActivity'))return bizNoAccess('Assistant activity');
+ const key='aiact',d=bizGet(key,`/api/assistant/activity?${bq()}`);
+ const intro=head('CONTROL · ASSISTANT','Assistant activity','Every change the assistant proposed, who asked, and what happened to it.');
+ const banner=`<div class="card panel gst-banner" role="note"><span class="status s-pending">Demo</span><span>Demo: no tokens or model costs: rule-based. Fictional data.</span></div>`;
+ if(!d)return intro+banner+bizWait(key,'Assistant activity');
+ const t=d.tiles,tiles=`<div class="metrics">${metric('Proposals',t.proposals,`${t.pending} waiting for a decision`,'✦')}${metric('Confirmed',t.confirmed_pct+'%',`${t.confirmed} of ${t.proposals} proposals`,'✓')}${metric('Cancelled',t.cancelled,'Dropped before any change','×')}${metric('Failed',t.failed,'Refused by the normal rules','!',t.failed>0)}</div>`;
+ const max=Math.max(1,...d.per_day.map(x=>x.count));
+ const bars=`<div class="ai-bars" role="img" aria-label="Proposals per day, last 7 days">${d.per_day.map(x=>`<div class="ai-col"><b>${x.count}</b><i style="height:${Math.max(3,Math.round(x.count/max*80))}px"></i><span>${new Date(x.date+'T00:00:00').toLocaleDateString('en-IN',{weekday:'short'})}</span></div>`).join('')}</div>`;
+ const imax=Math.max(1,...d.by_intent.map(x=>x.count));
+ const ints=d.by_intent.length?d.by_intent.map(x=>`<div class="ai-int"><span>${esc(x.intent.replace(/_/g,' '))}</span><div><i style="width:${Math.round(x.count/imax*100)}%"></i></div><b>${x.count}</b></div>`).join(''):'<p class="empty">No proposals yet.</p>';
+ const rows=d.items.map(i=>`<tr><td>${esc(new Date(i.created_at).toLocaleString('en-IN',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}))}</td><td>${esc(i.who)}</td><td>${esc(i.input_text)}</td><td><b>${esc(i.summary||i.kind)}</b><small class="biz-sub">${esc(i.result_text)}</small></td><td>${bizTag(i.status,(aiStatusCls[i.status]||'s-pending').slice(2))}</td></tr>`).join('');
+ return `${intro}${banner}${tiles}<div class="gst-two"><section class="card panel">${panelTitle('Proposals per day · last 7 days')}${bars}</section><section class="card panel">${panelTitle('By intent')}${ints}</section></div><section class="card panel">${panelTitle('All proposals',`<span class="subtle">${d.items.length} shown</span>`)}${rows?`<div class="table-wrap"><table class="table ai-act-table"><thead><tr><th>When</th><th>Who</th><th>Asked</th><th>Proposal</th><th>Status</th></tr></thead><tbody>${rows}</tbody></table></div>`:'<p class="empty">Nothing proposed yet. Open the Assistant and ask for a change.</p>'}</section>`}
+document.addEventListener('click',e=>{const t=e.target.closest('[data-ai]');if(!t)return;const a=t.dataset.ai;
+ if(a==='chip')aiAsk(t.dataset.t);else if(a==='confirm'||a==='cancel')aiDecide(+t.dataset.m,+t.dataset.c,a)});
+document.addEventListener('submit',e=>{if(e.target.id!=='aiForm')return;e.preventDefault();aiAsk($('#aiText').value)});
+document.addEventListener('input',e=>{if(e.target.id==='aiText')ai.input=e.target.value});
+// end assistant
+

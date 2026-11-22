@@ -1755,6 +1755,620 @@ def get_reconciliations(sb, query):
 # --- END RECONCILIATION -----------------------------------------------------------------------------
 
 
+
+
+# --- ASSISTANT ---------------------------------------------------------------------------------------
+# Demo assistant: a deterministic keyword/rule engine (English, Hindi, Hinglish). NO language model, NO external call.
+# `assistant_ask` answers read-only questions from this org's invoices/bills, or STAGES a change as an `ai_action` row
+# (status Proposed). `assistant_confirm` re-validates, checks the role and then runs the EXISTING handlers
+# (create_invoice, patch_invoice_status, patch_bill_status, create_event, send_reminder), so transition tables,
+# optimistic guards, approval rules and GST/numbering rules are not bypassed.
+
+AI_ACTIVITY_ROLES = {"owner", "finance_manager", "auditor"}
+AI_KIND_ROLES = {  # who may confirm each kind of staged change
+    "invoice_paid": ("owner", "finance_manager", "ar"),
+    "bill_approve": ("owner", "finance_manager", "approver"),
+    "remind_overdue": ("owner", "finance_manager", "ar"),
+    "schedule_meeting": ("owner", "finance_manager", "approver"),
+    "raise_invoice": ("owner", "finance_manager", "ar"),
+}
+AI_ROLE_LABEL = {"owner": "Owner", "finance_manager": "Finance Manager", "ar": "AR Accountant", "ap": "AP Accountant",
+                 "approver": "Approver", "auditor": "Auditor"}
+AI_EXAMPLES = {
+    "ar": ["Top 5 customers by sales", "What is overdue?", "Who owes me the most?", "Cash position",
+           "Remind overdue customers", "Mark INV-2025-0832 as paid", "इस महीने कितनी बिक्री हुई?"],
+    "ap": ["Bills needing approval", "Which bills are due this week?", "What is overdue?", "Cash position",
+           "Approve BILL-4521", "Schedule a meeting with Northstar tomorrow 3pm"],
+}
+AI_NUMW = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+AI_DAYS = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+AI_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+AI_INV_RE = re.compile(r"\binv-[a-z0-9][a-z0-9._-]*", re.I)
+AI_BILL_RE = re.compile(r"\bbill-[a-z0-9][a-z0-9._-]*", re.I)
+
+
+def _adec(v):
+    try:
+        return Decimal(str(v)) if v not in (None, "") else Decimal(0)
+    except InvalidOperation:
+        return Decimal(0)
+
+
+def _ainr(v):
+    """Rupees with Indian digit grouping, from a Decimal (paise shown only when non-zero)."""
+    v = _adec(v).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    whole, frac = divmod(abs(v), 1)
+    s = str(int(whole))
+    if len(s) > 3:
+        head, tail, parts = s[:-3], s[-3:], []
+        while len(head) > 2:
+            parts.insert(0, head[-2:])
+            head = head[:-2]
+        if head:
+            parts.insert(0, head)
+        s = ",".join(parts) + "," + tail
+    return ("-" if v < 0 else "") + "₹" + s + (f".{int(frac * 100):02d}" if frac else "")
+
+
+def _aout(inv):
+    return max(Decimal(0), _adec(inv["total"]) - _adec(inv.get("amount_paid")))
+
+
+def _a_actor(sb, d):
+    org = org_id(d.get("org"), "Business")
+    return calendar_actor(sb, d, org)  # 403 unless the role belongs to that business
+
+
+def _a_table(columns, rows, num=()):
+    return {"columns": columns, "rows": rows, "num": list(num)}
+
+
+def _a_reply(intent, text, table=None, suggestions=None, actions=None, staged=False):
+    return 200, {"intent": intent, "answer_text": text, "table": table, "actions": actions or [], "staged": staged,
+                 "suggestions": suggestions or [], "engine": "Demo assistant · rule-based, no external AI"}
+
+
+def _a_find(sb, table, raw):
+    for key in (raw, raw.upper()):
+        row = sb.one(table, "*", {"id": eq(key)})
+        if row:
+            return row
+    return None
+
+
+def _a_party(sb, org, text):
+    """Find a connected business named in the text (id or first word of its name)."""
+    best = None
+    for b in sb.select("businesses", "id,name"):
+        if b["id"] == org:
+            continue
+        words = [b["id"].lower(), b["name"].lower().split()[0]]
+        if any(re.search(r"(?<![a-z0-9])" + re.escape(w) + r"(?![a-z0-9])", text) for w in words if len(w) > 2):
+            best = best or b
+    return best
+
+
+def _a_amount(text):
+    m = re.search(r"(?:₹|rs\.?|inr|for|का|ka)\s*(\d[\d,]*(?:\.\d+)?)\s*(k|lakh|lakhs|lac|l|cr|crore)?\b", text)
+    if not m:
+        m = re.search(r"(\d[\d,]*(?:\.\d+)?)\s*(k|lakh|lakhs|lac|cr|crore)?\b", text)
+    if not m:
+        return None, text
+    n = _adec(m.group(1).replace(",", ""))
+    n *= {"k": 1000, "lakh": 100000, "lakhs": 100000, "lac": 100000, "l": 100000, "cr": 10000000, "crore": 10000000}.get(m.group(2) or "", 1)
+    return n, (text[:m.start()] + " " + text[m.end():])
+
+
+def _a_date(text):
+    t0 = datetime.date.today()
+    if re.search(r"day after tomorrow|parso|परसों|परसो", text):
+        return t0 + datetime.timedelta(days=2)
+    if re.search(r"tomorrow|\bkal\b|कल", text):
+        return t0 + datetime.timedelta(days=1)
+    if re.search(r"\btoday\b|\baaj\b|आज", text):
+        return t0
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", text)
+    if m:
+        try:
+            return datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = re.search(r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b", text)
+    if m:
+        try:
+            d = datetime.date(t0.year, AI_MONTHS.index(m.group(2)) + 1, int(m.group(1)))
+            return d if d >= t0 else d.replace(year=t0.year + 1)
+        except ValueError:
+            return None
+    for i, name in enumerate(AI_DAYS):
+        if name in text:
+            return t0 + datetime.timedelta(days=(i - t0.weekday()) % 7 or 7)
+    return None
+
+
+def _a_time(text):
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", text)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2) or 0)
+        if h > 12 or mi > 59 or h == 0:
+            return None
+        h = h % 12 + (12 if m.group(3) == "pm" else 0)
+        return f"{h:02d}:{mi:02d}"
+    m = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", text)
+    if m:
+        return f"{int(m.group(1)):02d}:{m.group(2)}"
+    m = re.search(r"\b(\d{1,2})\s*(?:baje|बजे)", text)
+    if m and 1 <= int(m.group(1)) <= 12:
+        h = int(m.group(1))
+        pm = h < 8 or h == 12 or bool(re.search(r"shaam|शाम|dopahar|दोपहर|raat|रात", text))
+        if re.search(r"subah|सुबह", text):
+            pm = False
+        return f"{(h % 12) + (12 if pm else 0):02d}:00"
+    return None
+
+
+def _a_ar_rows(sb, org):
+    return [i for i in sb.select("invoices", "*", {"supplier": eq(org)}) if i["status"] not in ("Draft", "Rejected")]
+
+
+def _a_open_ar(sb, org):
+    return [i for i in _a_ar_rows(sb, org) if i["status"] in OPEN_AR | {"Dispute"} and _aout(i) > 0]
+
+
+def _a_open_ap(sb, org):
+    return [b for b in sb.select("bills", "*", {"buyer": eq(org)}) if b["status"] in OPEN_AP]
+
+
+def _a_late(due):
+    n = dnum(due)
+    return max(0, dnum(today()) - n) if n else 0
+
+
+# ---- read-only intents
+def _a_top(sb, org, role, text, vendors):
+    m = re.search(r"\b(?:top|best|biggest|largest|शीर्ष)\s*(\d{1,2}|" + "|".join(AI_NUMW) + r")\b", text) or re.search(r"\b(\d{1,2})\b", text)
+    n = 5
+    if m:
+        n = int(m.group(1)) if m.group(1).isdigit() else AI_NUMW[m.group(1)]
+    n = max(1, min(n, 10))
+    totals = {}
+    names = {b["id"]: b["name"] for b in sb.select("businesses", "id,name")}
+    if vendors:
+        for b in sb.select("bills", "*", {"buyer": eq(org)}):
+            if b["status"] != "Rejected":
+                t = totals.setdefault(b["vendor"], [Decimal(0), 0])
+                t[0] += _adec(b["amount"])
+                t[1] += 1
+        label, intent = "vendors by spend", "top_vendors"
+    else:
+        for i in _a_ar_rows(sb, org):
+            t = totals.setdefault(i["customer"], [Decimal(0), 0])
+            t[0] += _adec(i["total"])
+            t[1] += 1
+        label, intent = "customers by sales", "top_customers"
+    ranked = sorted(totals.items(), key=lambda kv: kv[1][0], reverse=True)[:n]
+    if not ranked:
+        return _a_reply(intent, f"No {label.split(' by')[0]} records found for this business yet.", suggestions=AI_EXAMPLES["ar" if not vendors else "ap"][:3])
+    rows = [[str(k + 1), names.get(c, c), str(v[1]), _ainr(v[0])] for k, (c, v) in enumerate(ranked)]
+    return _a_reply(intent, f"Top {len(ranked)} {label}, from {sum(v[1] for _, v in ranked)} records (excluding drafts and rejected).",
+                    _a_table(["#", "Party", "Records", "Total"], rows, (0, 2, 3)), ["Who owes me the most?", "What is overdue?"])
+
+
+def _a_sales(sb, org, role, text):
+    t0 = datetime.date.today()
+    last = bool(re.search(r"last month|previous month|पिछले महीने|पिछला महीना|pichle mahine|pichhle mahine", text))
+    first = t0.replace(day=1)
+    if last:
+        first = (first - datetime.timedelta(days=1)).replace(day=1)
+    prefix = first.isoformat()[:7]
+    label = first.strftime("%B %Y")
+    if role in ("ap", "approver"):
+        rows = [b for b in sb.select("bills", "*", {"buyer": eq(org)}) if b["received_date"][:7] == prefix and b["status"] != "Rejected"]
+        total = sum((_adec(b["amount"]) for b in rows), Decimal(0))
+        return _a_reply("sales_month", f"This business is a buyer, so here are purchases: {len(rows)} bills received in {label} worth {_ainr(total)}.",
+                        _a_table(["Bill", "Vendor", "Amount"], [[b["id"], biz_name(sb, b["vendor"]), _ainr(b["amount"])] for b in rows[:8]], (2,)) if rows else None,
+                        ["Bills needing approval", "Which bills are due this week?"])
+    rows = [i for i in _a_ar_rows(sb, org) if i["issue_date"][:7] == prefix]
+    total = sum((_adec(i["total"]) for i in rows), Decimal(0))
+    paid = sum((_adec(i.get("amount_paid")) for i in rows), Decimal(0))
+    if not rows:
+        return _a_reply("sales_month", f"No invoices were issued in {label}.", suggestions=["Top 5 customers by sales", "What is overdue?"])
+    return _a_reply("sales_month", f"{label}: {len(rows)} invoices issued, {_ainr(total)} invoiced (incl. GST), {_ainr(paid)} collected so far.",
+                    _a_table(["Invoice", "Customer", "Status", "Total"], [[i["id"], biz_name(sb, i["customer"]), i["status"], _ainr(i["total"])] for i in
+                                                                          sorted(rows, key=lambda x: _adec(x["total"]), reverse=True)[:8]], (3,)),
+                    ["Top 5 customers by sales", "Who owes me the most?"])
+
+
+def _a_overdue(sb, org, role, text, payables):
+    t0 = today()
+    if payables:
+        rows = sorted([b for b in _a_open_ap(sb, org) if b["due_date"] < t0], key=lambda b: b["due_date"])
+        if not rows:
+            return _a_reply("overdue_bills", "No bills are past their due date.", suggestions=["Which bills are due this week?"])
+        total = sum((_adec(b["amount"]) for b in rows), Decimal(0))
+        return _a_reply("overdue_bills", f"{len(rows)} bills are past due, {_ainr(total)} in total.",
+                        _a_table(["Bill", "Vendor", "Due", "Days late", "Amount"], [[b["id"], biz_name(sb, b["vendor"]), b["due_date"], str(_a_late(b["due_date"])), _ainr(b["amount"])] for b in rows[:10]], (3, 4)),
+                        ["Which bills are due this week?", "Bills needing approval"])
+    rows = sorted([i for i in _a_open_ar(sb, org) if i["due_date"] < t0 or i["status"] == "Overdue"],
+                  key=lambda i: _aout(i) * (_a_late(i["due_date"]) + 1), reverse=True)
+    if not rows:
+        return _a_reply("overdue", "Nothing is overdue. Every open invoice is within its due date.", suggestions=["Who owes me the most?", "Cash position"])
+    total = sum((_aout(i) for i in rows), Decimal(0))
+    return _a_reply("overdue", f"{len(rows)} invoices are overdue, {_ainr(total)} outstanding.",
+                    _a_table(["Invoice", "Customer", "Due", "Days late", "Outstanding"], [[i["id"], biz_name(sb, i["customer"]), i["due_date"], str(_a_late(i["due_date"])), _ainr(_aout(i))] for i in rows[:10]], (3, 4)),
+                    ["Remind overdue customers", "Who owes me the most?"])
+
+
+def _a_week(sb, org):
+    t0, t1 = today(), iso_from(dnum(today()) + 7)
+    rows = sorted([b for b in _a_open_ap(sb, org) if t0 <= b["due_date"] <= t1], key=lambda b: b["due_date"])
+    if not rows:
+        return _a_reply("bills_due_week", "No open bills fall due in the next 7 days.", suggestions=["What is overdue?", "Bills needing approval"])
+    total = sum((_adec(b["amount"]) for b in rows), Decimal(0))
+    return _a_reply("bills_due_week", f"{len(rows)} bill{'s are' if len(rows) != 1 else ' is'} due in the next 7 days, {_ainr(total)} in total.",
+                    _a_table(["Bill", "Vendor", "Due", "Status", "Amount"], [[b["id"], biz_name(sb, b["vendor"]), b["due_date"], b["status"], _ainr(b["amount"])] for b in rows], (4,)),
+                    ["What is overdue?", "Bills needing approval"])
+
+
+def _a_owes(sb, org, role, payables):
+    names = {b["id"]: b["name"] for b in sb.select("businesses", "id,name")}
+    totals = {}
+    if payables:
+        for b in _a_open_ap(sb, org):
+            t = totals.setdefault(b["vendor"], [Decimal(0), 0])
+            t[0] += _adec(b["amount"])
+            t[1] += 1
+        head_, who = "You owe", "vendors"
+    else:
+        for i in _a_open_ar(sb, org):
+            t = totals.setdefault(i["customer"], [Decimal(0), 0])
+            t[0] += _aout(i)
+            t[1] += 1
+        head_, who = "Owed to you by", "customers"
+    ranked = sorted(totals.items(), key=lambda kv: kv[1][0], reverse=True)[:5]
+    if not ranked:
+        return _a_reply("who_owes", "Nothing is outstanding right now.", suggestions=["Cash position"])
+    grand = sum((v[0] for v in totals.values()), Decimal(0))
+    top = ranked[0]
+    return _a_reply("who_owes", f"{names.get(top[0], top[0])} is the largest at {_ainr(top[1][0])}. {head_} {len(totals)} {who}: {_ainr(grand)} in total.",
+                    _a_table(["Party", "Open records", "Outstanding"], [[names.get(c, c), str(v[1]), _ainr(v[0])] for c, v in ranked], (1, 2)),
+                    ["What is overdue?", "Remind overdue customers"] if not payables else ["Which bills are due this week?"])
+
+
+def _a_cash(sb, org):
+    opening = _adec(org_settings(sb, org).get("opening_balance"))
+    ar = sum((_aout(i) for i in _a_open_ar(sb, org) if i["status"] != "Dispute"), Decimal(0))
+    held = sum((_aout(i) for i in _a_open_ar(sb, org) if i["status"] == "Dispute"), Decimal(0))
+    ap = sum((_adec(b["amount"]) for b in _a_open_ap(sb, org)), Decimal(0))
+    net = opening + ar - ap
+    rows = [["Opening balance (demo setting)", _ainr(opening)], ["Receivables outstanding", _ainr(ar)], ["On hold in disputes (not counted)", _ainr(held)],
+            ["Payables open", _ainr(ap)], ["Projected net if all settle", _ainr(net)]]
+    return _a_reply("cash_position", f"Projected net position {_ainr(net)}: opening {_ainr(opening)} plus receivables {_ainr(ar)} minus payables {_ainr(ap)}. "
+                    "This is arithmetic on demo records, not a bank balance.", _a_table(["Item", "Amount"], rows, (1,)),
+                    ["What is overdue?", "Which bills are due this week?"])
+
+
+def _a_approvals(sb, org):
+    rows = sorted([b for b in _a_open_ap(sb, org) if b["status"] == "Needs approval"], key=lambda b: b["due_date"])
+    if not rows:
+        return _a_reply("bills_approval", "No bills are waiting for approval.", suggestions=["Which bills are due this week?"])
+    total = sum((_adec(b["amount"]) for b in rows), Decimal(0))
+    return _a_reply("bills_approval", f"{len(rows)} bills need approval, {_ainr(total)} in total.",
+                    _a_table(["Bill", "Vendor", "Due", "Amount"], [[b["id"], biz_name(sb, b["vendor"]), b["due_date"], _ainr(b["amount"])] for b in rows], (3,)),
+                    [f"Approve {rows[0]['id']}", "Which bills are due this week?"])
+
+
+def _a_lookup(sb, org, raw, is_bill):
+    row = _a_find(sb, "bills" if is_bill else "invoices", raw)
+    mine = row and (row["buyer"] == org if is_bill else org in (row["supplier"], row["customer"]))
+    if not mine:
+        return _a_reply("lookup", f"I could not find {raw.upper()} in this business.", suggestions=AI_EXAMPLES["ap" if is_bill else "ar"][:3])
+    if is_bill:
+        return _a_reply("lookup", f"{row['id']}: {row['vendor']}, {_ainr(row['amount'])}, status {row['status']}, due {row['due_date']}.",
+                        suggestions=[f"Approve {row['id']}"] if row["status"] == "Needs approval" else [])
+    return _a_reply("lookup", f"{row['id']}: {row['customer']}, {_ainr(row['total'])} (outstanding {_ainr(_aout(row))}), status {row['status']}, due {row['due_date']}.",
+                    suggestions=[f"Mark {row['id']} as paid"] if row["status"] in OPEN_AR else [])
+
+
+# ---- staging
+def _a_stage(sb, org, role, text, intent, kind, payload, title, record, changes):
+    aid = "ai_" + uuid.uuid4().hex[:10]
+    sb.insert("ai_action", {"id": aid, "org": org, "actor": org, "role": role, "input_text": text, "intent": intent, "kind": kind,
+                            "payload": json.dumps(dict(payload, summary=title), ensure_ascii=False), "status": "Proposed",
+                            "result_text": "", "created_at": now(), "decided_at": ""})
+    card = {"id": aid, "kind": kind, "title": title, "record": record, "changes": changes,
+            "permitted": [AI_ROLE_LABEL[r] for r in AI_KIND_ROLES[kind]], "roles": list(AI_KIND_ROLES[kind]), "note": "Nothing changes until a permitted person confirms."}
+    return _a_reply(intent, "I have prepared this change. Review it and confirm, or cancel. Nothing has been changed yet.",
+                    actions=[card], staged=True)
+
+
+def _a_refuse(intent, role, kind):
+    who = ", ".join(AI_ROLE_LABEL[r] for r in AI_KIND_ROLES[kind])
+    return _a_reply(intent, f"Your role ({AI_ROLE_LABEL.get(role, role)}) cannot make this change. It can be confirmed by: {who}.")
+
+
+def _a_stage_paid(sb, org, role, text, raw):
+    if role not in AI_KIND_ROLES["invoice_paid"]:
+        return _a_refuse("mark_paid", role, "invoice_paid")
+    inv = _a_find(sb, "invoices", raw)
+    if not inv or inv["supplier"] != org:
+        return _a_reply("mark_paid", f"I could not find {raw.upper()} among your sales invoices.", suggestions=["What is overdue?"])
+    if inv["status"] == "Paid":
+        return _a_reply("mark_paid", f"{inv['id']} is already marked Paid.")
+    if "Paid" not in INVOICE_TRANSITIONS.get(inv["status"], set()):
+        why = " The buyer has to approve it first." if inv["status"] in ("Sent", "Viewed", "Pending approval") else ""
+        return _a_reply("mark_paid", f"{inv['id']} is {inv['status']}, and an invoice cannot move from {inv['status']} to Paid.{why}",
+                        suggestions=["What is overdue?"])
+    if "share_payment_status" not in connection_scopes(sb, inv["supplier"], inv["customer"]):
+        return _a_reply("mark_paid", "Payment status sharing is not enabled for this connection, so it cannot be recorded.")
+    cust = biz_name(sb, inv["customer"])
+    return _a_stage(sb, org, role, text, "mark_paid", "invoice_paid", {"invoice_id": inv["id"]}, f"Mark {inv['id']} as Paid",
+                    f"{inv['id']} · {cust} · {_ainr(inv['total'])}",
+                    [f"Invoice status: {inv['status']} → Paid", f"Records {_ainr(_aout(inv))} as received (demo, no money moves)",
+                     f"Updates {cust}'s linked bill and notifies them", "Adds a row to the invoice activity trail"])
+
+
+def _a_stage_approve(sb, org, role, text, raw):
+    if role not in AI_KIND_ROLES["bill_approve"]:
+        return _a_refuse("approve_bill", role, "bill_approve")
+    bill = _a_find(sb, "bills", raw)
+    if not bill or bill["buyer"] != org:
+        return _a_reply("approve_bill", f"I could not find {raw.upper()} in your bills.", suggestions=["Bills needing approval"])
+    if bill["status"] != "Needs approval":
+        return _a_reply("approve_bill", f"{bill['id']} is {bill['status']}. Only bills in Needs approval can be approved.")
+    limit = approval_threshold(sb, org)
+    if limit and _adec(bill["amount"]) > limit and role != "approver":
+        return _a_reply("approve_bill", f"{bill['id']} is above {_ainr(limit)}, so the approval rule requires the Approver.")
+    vendor = biz_name(sb, bill["vendor"])
+    return _a_stage(sb, org, role, text, "approve_bill", "bill_approve", {"bill_id": bill["id"]}, f"Approve {bill['id']}",
+                    f"{bill['id']} · {vendor} · {_ainr(bill['amount'])}",
+                    ["Bill status: Needs approval → Approved", "Syncs approval to the supplier's shared invoice", "Adds a row to the bill activity trail"])
+
+
+def _a_stage_remind(sb, org, role, text):
+    if role not in AI_KIND_ROLES["remind_overdue"]:
+        return _a_refuse("remind_overdue", role, "remind_overdue")
+    rows = sorted([i for i in _a_open_ar(sb, org) if i["status"] != "Dispute" and (i["due_date"] < today() or i["status"] == "Overdue")],
+                  key=lambda i: _aout(i) * (_a_late(i["due_date"]) + 1), reverse=True)[:10]
+    if not rows:
+        return _a_reply("remind_overdue", "There are no overdue invoices to remind about. Disputed invoices are left out.")
+    items, changes = [], []
+    for i in rows:
+        late = _a_late(i["due_date"])
+        tone = "gentle" if late < 15 else "firm" if late < 30 else "final"
+        items.append({"id": i["id"], "tone": tone})
+        changes.append(f"{i['id']} · {biz_name(sb, i['customer'])} · {_ainr(_aout(i))} · {late} days late · {tone} tone")
+    return _a_stage(sb, org, role, text, "remind_overdue", "remind_overdue", {"items": items}, f"Record {len(items)} payment reminders (demo)",
+                    f"{len(items)} overdue invoices", changes + ["Reminders are recorded in the demo only. No email or message is sent."])
+
+
+def _a_stage_meeting(sb, org, role, text):
+    if role not in AI_KIND_ROLES["schedule_meeting"]:
+        return _a_refuse("schedule_meeting", role, "schedule_meeting")
+    low = text.lower()
+    day = _a_date(low)
+    if not day:
+        return _a_reply("schedule_meeting", "Which day? For example: Schedule a meeting with Apex tomorrow 3pm.")
+    if day < datetime.date.today():
+        return _a_reply("schedule_meeting", "Meetings can't be scheduled in the past.")
+    start = _a_time(low) or "10:00"
+    h, mi = int(start[:2]), int(start[3:])
+    end = f"{min(h + 1, 23):02d}:{mi:02d}" if h < 23 else "23:59"
+    party = _a_party(sb, org, low)
+    title = f"Meeting with {party['name']}" if party else "Meeting"
+    return _a_stage(sb, org, role, text, "schedule_meeting", "schedule_meeting",
+                    {"title": title, "start_date": day.isoformat(), "start_time": start, "end_time": end},
+                    f"Schedule: {title}", f"{day.strftime('%a %d %b %Y')} · {start} to {end}",
+                    [f"Adds a meeting to the {biz_name(sb, org)} calendar", "No invitation is sent in this demo"] + ([] if _a_time(low) else ["No time was given, so 10:00 is assumed"]))
+
+
+def _a_next_invoice_id(sb):
+    n = len(sb.select("invoices", "id")) + 901
+    while True:
+        iid = f"INV-{datetime.date.today().year}-{n:04d}"
+        if not sb.one("invoices", "id", {"id": eq(iid)}):
+            return iid
+        n += 1
+
+
+def _a_stage_invoice(sb, org, role, text):
+    if role not in AI_KIND_ROLES["raise_invoice"]:
+        return _a_refuse("raise_invoice", role, "raise_invoice")
+    low = text.lower()
+    cust = _a_party(sb, org, low)
+    if not cust:
+        return _a_reply("raise_invoice", "Which customer? For example: Raise invoice to Meridian for 50000 brand work.")
+    amount, rest = _a_amount(low)
+    if not amount or amount <= 0:
+        return _a_reply("raise_invoice", "What amount? For example: Raise invoice to Meridian for 50000 brand work.")
+    if "exchange_invoices" not in connection_scopes(sb, org, cust["id"]):
+        return _a_reply("raise_invoice", f"Invoice sharing is not enabled with {cust['name']}, so an invoice cannot be sent.")
+    tm = re.search(r"(\d{1,2})\s*%", rest)
+    rate = Decimal(tm.group(1)) if tm and tm.group(1) in ("0", "5", "12", "18", "28") else Decimal(18)
+    rest = re.sub(r"\d{1,2}\s*%|gst|\bat\b", " ", rest)
+    rest = re.sub(r"\b(raise|create|make|generate|new|send|an?|the|invoice|invoices|to|for|of|banao|bana|do|please|rs|inr)\b|[₹बनाओ]|" + re.escape(cust["id"]) + "|" + re.escape(cust["name"].split()[0].lower()), " ", rest)
+    desc = re.sub(r"\s+", " ", rest).strip(" ,.-:") or "Services"
+    desc = desc[:200][0].upper() + desc[:200][1:]
+    amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    gst = (amount * rate / 100).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    due = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
+    return _a_stage(sb, org, role, text, "raise_invoice", "raise_invoice",
+                    {"customer": cust["id"], "description": desc, "rate": str(amount), "tax": str(rate), "due_date": due},
+                    f"Raise invoice to {cust['name']}", f"{desc} · taxable {_ainr(amount)}",
+                    [f"Taxable {_ainr(amount)} + GST {rate}% {_ainr(gst)} = total {_ainr(amount + gst)}", f"Issued today, due {due} (30 days)",
+                     f"Number {_a_next_invoice_id(sb)} is assigned when you confirm", f"Shared with {cust['name']} and added to their bills inbox (demo, no email)"])
+
+
+# ---- intent engine
+def assistant_ask(sb, d):
+    role, info, person = _a_actor(sb, d)
+    org = info["org"]
+    text = clean_text(d.get("text"), "Message", 300)
+    t = re.sub(r"\s+", " ", text.lower())
+    inv_m, bill_m = AI_INV_RE.search(t), AI_BILL_RE.search(t)
+    payables = role in ("ap", "approver") or bool(re.search(r"\b(vendors?|suppliers?|payables?|bills?)\b|\bwe owe\b|\bi owe\b|विक्रेता|बिल", t))
+    # --- actions (staged only)
+    if inv_m and re.search(r"paid|received|settled|payment|भुगतान|मिल गया|मिला|\bmark\b", t):
+        return _a_stage_paid(sb, org, role, text, inv_m.group(0))
+    if bill_m and re.search(r"approv|मंजूर|मंज़ूर|अप्रूव|\bok\b|pass", t):
+        return _a_stage_approve(sb, org, role, text, bill_m.group(0))
+    if re.search(r"remind|nudge|chase|follow.?up|yaad|याद|रिमाइंडर", t):
+        return _a_stage_remind(sb, org, role, text)
+    if re.search(r"meeting|schedule|appointment|मीटिंग|book a call|set up a call", t):
+        return _a_stage_meeting(sb, org, role, text)
+    if re.search(r"(raise|create|make|generate|new|banao|बनाओ|बनाएं).{0,20}(invoice|इनवॉइस|bill)|invoice (to|for)", t) and not inv_m:
+        return _a_stage_invoice(sb, org, role, text)
+    # --- read-only questions
+    if inv_m or bill_m:
+        return _a_lookup(sb, org, (inv_m or bill_m).group(0), bool(bill_m and not inv_m))
+    if re.search(r"approv|मंजूर|मंज़ूर|अप्रूव", t) and re.search(r"bill|बिल", t):
+        return _a_approvals(sb, org)
+    if re.search(r"bill|बिल|payable", t) and re.search(r"week|hafta|hafte|हफ्ते|हफ़्ते|सप्ताह|due|देय", t) and not re.search(r"overdue|past due|बकाया", t):
+        return _a_week(sb, org)
+    if re.search(r"\bowes?\b|\bowe\b|देना|देनदार|\bdena\b|udhaar|उधार|kaun.{0,20}(baaki|baki)|किसके.{0,12}बकाया|सबसे ज्यादा.{0,15}बकाया|biggest debtor", t):
+        return _a_owes(sb, org, role, payables)
+    if re.search(r"top|best|biggest|largest|highest|सबसे|बड़े|बड़ा|sabse", t) and re.search(r"customer|client|grahak|ग्राहक|कस्टमर|buyer|vendor|supplier|विक्रेता", t):
+        return _a_top(sb, org, role, t, bool(re.search(r"vendor|supplier|विक्रेता", t)))
+    if re.search(r"cash|balance|नकद|कैश|बैलेंस|position|liquidity", t):
+        return _a_cash(sb, org)
+    if re.search(r"sales|\bsale\b|revenue|turnover|बिक्री|बिक्रि|bikri|bikree|invoiced|कमाई", t):
+        return _a_sales(sb, org, role, t)
+    if re.search(r"overdue|over due|past due|\blate\b|baaki|\bbaki\b|बकाया|देर से|pending payment", t):
+        return _a_overdue(sb, org, role, t, payables)
+    ex = AI_EXAMPLES["ap" if role in ("ap", "approver") else "ar"]
+    return _a_reply("fallback", "I did not understand that. I am a simple rule-based demo assistant that recognises a fixed set of questions and commands "
+                    "(English, Hindi and Hinglish). Try one of the examples below.", suggestions=ex)
+
+
+# ---- confirm / cancel
+def _a_run(sb, row, role, org):
+    p = json.loads(row["payload"] or "{}")
+    kind = row["kind"]
+    if kind == "invoice_paid":
+        inv = sb.one("invoices", "*", {"id": eq(p["invoice_id"])})
+        if not inv or inv["supplier"] != org:
+            raise ApiError(404, "Invoice not found")
+        patch_invoice_status(sb, inv["id"], {"status": "Paid", "actor": org, "role": role})
+        return f"{inv['id']} marked Paid (demo, no money moved)."
+    if kind == "bill_approve":
+        bill = sb.one("bills", "*", {"id": eq(p["bill_id"])})
+        if not bill or bill["buyer"] != org:
+            raise ApiError(404, "Bill not found")
+        patch_bill_status(sb, bill["id"], {"status": "Approved", "actor": org, "role": role})
+        return f"{bill['id']} approved."
+    if kind == "remind_overdue":
+        done, skipped = 0, []
+        for it in p.get("items", [])[:10]:
+            inv = sb.one("invoices", "*", {"id": eq(str(it.get("id")))})
+            if not inv or inv["supplier"] != org:
+                skipped.append(str(it.get("id")))
+                continue
+            tone = it.get("tone") if it.get("tone") in TONES else "gentle"
+            late = _a_late(inv["due_date"])
+            body = REMINDER_TEXT[tone].format(name=biz_name(sb, inv["customer"]), iid=inv["id"], amount=inr(outstanding(inv)), due=inv["due_date"], late=late)
+            try:
+                send_reminder(sb, inv["id"], {"role": role, "actor": org, "tone": tone, "body": body})
+                done += 1
+            except ApiError:
+                skipped.append(inv["id"])
+        if not done:
+            raise ApiError(409, "None of these invoices are open for collection any more")
+        return f"{done} demo reminders recorded. Nothing was emailed." + (f" Skipped (no longer open): {', '.join(skipped)}." if skipped else "")
+    if kind == "schedule_meeting":
+        _, res = create_event(sb, {"role": role, "actor": org, "kind": "meeting", "title": p["title"],
+                                   "description": "Scheduled from the demo assistant (rule-based). No invitation is sent.",
+                                   "start_date": p["start_date"], "start_time": p["start_time"], "end_time": p["end_time"], "attendees": []})
+        return f"Meeting added to the calendar ({p['start_date']} {p['start_time']})."
+    if kind == "raise_invoice":
+        iid = _a_next_invoice_id(sb)
+        _, res = create_invoice(sb, {"id": iid, "supplier": org, "customer": p["customer"], "description": p["description"],
+                                     "issue_date": today(), "due_date": p["due_date"], "qty": "1", "rate": p["rate"], "tax": p["tax"], "po_number": ""})
+        return f"Invoice {iid} created and shared · total {_ainr(res['total'])}."
+    raise ApiError(400, "Unknown action")
+
+
+def _a_load(sb, d, cancel=False):
+    role, info, person = _a_actor(sb, d)
+    aid = clean_text(d.get("id"), "Proposal id", 40)
+    if not re.fullmatch(r"ai_[A-Za-z0-9_]+", aid):
+        raise ApiError(400, "Proposal id is not valid")
+    row = sb.one("ai_action", "*", {"id": eq(aid)})
+    if not row or row["org"] != info["org"]:  # another business's proposal looks the same as a missing one
+        raise ApiError(404, "Proposal not found")
+    if role not in AI_KIND_ROLES.get(row["kind"], ()) and not (cancel and role == row["role"]):
+        raise ApiError(403, "This role cannot " + ("cancel" if cancel else "confirm") + " this change")
+    if row["status"] != "Proposed":
+        raise ApiError(409, f"This proposal is already {row['status'].lower()}")
+    return role, info, person, row
+
+
+def assistant_confirm(sb, d):
+    role, info, person, row = _a_load(sb, d)
+    # Claim first (compare-and-set) so a double click or a second tab can never execute twice.
+    if not sb.update("ai_action", {"id": eq(row["id"]), "status": eq("Proposed")}, {"status": "Confirmed", "decided_at": now()}):
+        raise ApiError(409, "This proposal was already decided")
+    try:
+        result = _a_run(sb, row, role, info["org"])
+    except ApiError as e:
+        sb.update("ai_action", {"id": eq(row["id"])}, {"status": "Failed", "result_text": e.message[:300]})
+        raise
+    except Exception:
+        traceback.print_exc()
+        sb.update("ai_action", {"id": eq(row["id"])}, {"status": "Failed", "result_text": "Unexpected error"})
+        raise ApiError(500, "The demo server hit an unexpected error")
+    result = f"{result} Confirmed by {person['name']}."
+    sb.update("ai_action", {"id": eq(row["id"])}, {"result_text": result[:300]})
+    return 200, {"ok": True, "id": row["id"], "status": "Confirmed", "result_text": result}
+
+
+def assistant_cancel(sb, d):
+    role, info, person, row = _a_load(sb, d, cancel=True)
+    if not sb.update("ai_action", {"id": eq(row["id"]), "status": eq("Proposed")},
+                     {"status": "Cancelled", "decided_at": now(), "result_text": f"Cancelled by {person['name']}."}):
+        raise ApiError(409, "This proposal was already decided")
+    return 200, {"ok": True, "id": row["id"], "status": "Cancelled"}
+
+
+def assistant_activity(sb, query):
+    org = (query.get("org", [""])[0] or "").strip()
+    role = (query.get("role", [""])[0] or "").strip()
+    actor = (query.get("actor", [""])[0] or "").strip() or org
+    if not ORG_RE.fullmatch(org):
+        raise ApiError(400, "Business is required")
+    if role not in AI_ACTIVITY_ROLES:
+        raise ApiError(403, "This role does not have access to assistant activity")
+    calendar_actor(sb, {"role": role, "actor": actor}, org)
+    rows = sb.select("ai_action", "*", {"org": eq(org)}, order="created_at.desc", limit=500)
+    staff = {p["role_key"]: p for p in org_staff(sb, org)}
+    items = []
+    for r in rows:
+        try:
+            summary = json.loads(r["payload"] or "{}").get("summary", "")
+        except ValueError:
+            summary = ""
+        who = staff.get(r["role"])
+        items.append({"id": r["id"], "who": f"{who['name']} · {AI_ROLE_LABEL.get(r['role'], r['role'])}" if who else AI_ROLE_LABEL.get(r["role"], r["role"]),
+                      "role": r["role"], "input_text": r["input_text"], "intent": r["intent"], "kind": r["kind"], "status": r["status"],
+                      "summary": summary, "result_text": r["result_text"], "created_at": r["created_at"], "decided_at": r["decided_at"]})
+    by_status = {k: sum(1 for r in rows if r["status"] == k) for k in ("Proposed", "Confirmed", "Cancelled", "Failed")}
+    t0 = datetime.date.today()
+    per_day = []
+    for k in range(6, -1, -1):
+        dd = (t0 - datetime.timedelta(days=k)).isoformat()
+        per_day.append({"date": dd, "count": sum(1 for r in rows if r["created_at"][:10] == dd)})
+    by_intent = {}
+    for r in rows:
+        by_intent[r["intent"]] = by_intent.get(r["intent"], 0) + 1
+    pct = (Decimal(by_status["Confirmed"] * 100) / len(rows)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP) if rows else Decimal(0)
+    return 200, {"org": org, "items": items, "label": "Demo: no tokens or model costs: rule-based",
+                 "tiles": {"proposals": len(rows), "confirmed": by_status["Confirmed"], "confirmed_pct": float(pct), "cancelled": by_status["Cancelled"],
+                           "failed": by_status["Failed"], "pending": by_status["Proposed"]},
+                 "per_day": per_day, "by_intent": sorted(({"intent": k, "count": v} for k, v in by_intent.items()), key=lambda x: -x["count"])}
+
+
+# --- END ASSISTANT -----------------------------------------------------------------------------------
+
+
 SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
@@ -1818,6 +2432,8 @@ def dispatch(method, raw_path, headers, body):
                 return get_audit_pack(sb, query)
             if path == "/api/gst":
                 return get_gst(sb, query)
+            if path == "/api/assistant/activity":
+                return assistant_activity(sb, query)
             raise ApiError(404, "Not found")
         if method == "POST":
             if path == "/api/invoices":
@@ -1838,6 +2454,12 @@ def dispatch(method, raw_path, headers, body):
                 return reconcile_suggest(sb, data)
             if path == "/api/reconcile/confirm":
                 return reconcile_confirm(sb, data)
+            if path == "/api/assistant/ask":
+                return assistant_ask(sb, data)
+            if path == "/api/assistant/confirm":
+                return assistant_confirm(sb, data)
+            if path == "/api/assistant/cancel":
+                return assistant_cancel(sb, data)
             if path == "/api/payment-runs/preview":
                 return preview_run(sb, data)
             if path == "/api/payment-runs":
