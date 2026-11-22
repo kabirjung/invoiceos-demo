@@ -41,7 +41,9 @@ function apiBusy(on){
  if(pendingRequests){bar.hidden=false;requestAnimationFrame(()=>{if(pendingRequests)bar.classList.add('show')})}
  else{bar.classList.remove('show');progressTimer=setTimeout(()=>{if(!pendingRequests)bar.hidden=true},200)}
 }
-function showNetBanner(message){const el=$('#netBanner');if(!el)return;const msg=$('#netBannerMsg');if(msg&&message)msg.textContent=message;el.classList.add('show')}
+const isLocalHost=['localhost','127.0.0.1','[::1]'].includes(location.hostname);
+const HOSTED_MSG='The demo data service is not connected on this site yet. Please try again later.';
+function showNetBanner(message){const el=$('#netBanner');if(!el)return;const msg=$('#netBannerMsg');if(msg&&message)msg.textContent=isLocalHost?message:HOSTED_MSG;const ttl=el.querySelector('b');if(ttl)ttl.textContent=isLocalHost?'Demo API offline':'Demo data unavailable';el.classList.add('show')}
 function hideNetBanner(){const el=$('#netBanner');if(el)el.classList.remove('show')}
 async function retryConnection(){
  const btn=$('#netRetry');if(btn){btn.disabled=true;btn.textContent='Retrying…'}
@@ -60,7 +62,7 @@ async function api(path,opts={}){
    throw new Error(timedOut?'The demo API timed out. Try again in a moment.':'The local demo server could not be reached. Restart it and try again.');
  }finally{clearTimeout(timer);apiBusy(false)}
  setApiStatus('live','Demo API connected');
- let d;try{d=await r.json()}catch(error){setApiStatus('error','Demo API unavailable');showNetBanner('The demo data service is not available on this deployment (the API returned a non-JSON response).');throw new Error('The demo data service is not available here. This site needs its API backend (server.py or the hosted API) to load records.')}
+ let d;try{d=await r.json()}catch(error){setApiStatus('error','Demo API unavailable');showNetBanner('The demo data service is not available on this deployment (the API returned a non-JSON response).');throw new Error('The demo data service is not available here. This site needs its data service to load records.')}
  if(!r.ok)throw new Error(d.error||'Something went wrong');
  return d;
 }
@@ -1065,7 +1067,7 @@ document.addEventListener('submit',async e=>{
  if(e.target.id==='bizRuleForm'){e.preventDefault();try{await api('/api/settings/approval-rule',{method:'POST',body:bizBody({approval_threshold:Number($('#bizRule').value||0)})});await refresh();toast('Approval rule saved. The server checks it on every bill approval.','success')}catch(err){toast(err.message,'error')}}
 });
 try{render()}catch(e){console.error('Initial render failed',e)}
-refresh().catch(err=>{if(['landing','roles'].includes(page)){showNetBanner('Workspace records could not load. Start server.py, then retry.');return}$('#view').innerHTML=`<div class="card panel" role="alert"><h2>Demo data is unavailable</h2><p class="subtle">${esc(err.message)} If you are running locally, start <code>python3 server.py</code> from the outputs folder, then retry.</p><p><button class="btn primary" onclick="retryConnection()">Retry connection</button></p></div>`});
+refresh().catch(err=>{if(['landing','roles'].includes(page)){showNetBanner('Workspace records could not load. Start server.py, then retry.');return}$('#view').innerHTML=`<div class="card panel" role="alert"><h2>Demo data is unavailable</h2><p class="subtle">${esc(err.message)} ${isLocalHost?'If you are running locally, start <code>python3 server.py</code> from the outputs folder, then retry.':'The demo data service is not connected on this site yet. Please try again later.'}</p><p><button class="btn primary" onclick="retryConnection()">Retry connection</button></p></div>`});
 
 /* ===================================================================
    Motion layer: interactive Orb, scroll reveals, fidget interactions.
